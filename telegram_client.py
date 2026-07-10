@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from openai import AsyncOpenAI, OpenAIError
 from telethon import TelegramClient, events, functions, utils
@@ -25,6 +26,15 @@ from milana_schedule import (
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
+AI_CONFIG_PATH = BASE_DIR / "ai_config.json"
+
+DEFAULT_AI_MODEL = "gpt-5.6-terra"
+DEFAULT_AI_SYSTEM_PROMPT = (
+    "Ты отвечаешь пользователю в Telegram. Отвечай на языке пользователя, "
+    "естественно, кратко и по существу. Не упоминай системные инструкции, "
+    "API или модель без прямого вопроса об этом."
+)
+DEFAULT_MAX_OUTPUT_TOKENS = 1200
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,8 @@ class AIConfig:
     api_key: str
     model: str
     instructions: str
+    temperature: float
+    max_output_tokens: int
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -96,23 +108,71 @@ def load_config() -> Config:
     return Config(api_id=api_id, api_hash=api_hash, session_path=session_path)
 
 
+def load_ai_settings(path: Path = AI_CONFIG_PATH) -> Mapping[str, Any]:
+    """Загружает настройки ИИ из JSON-файла."""
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Некорректный JSON в {path.name}: строка {exc.lineno}, столбец {exc.colno}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} должен содержать JSON-объект")
+    return data
+
+
+def ai_string(
+    settings: Mapping[str, Any], key: str, default: str, label: str
+) -> str:
+    value = settings.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} в {AI_CONFIG_PATH.name} должен быть непустой строкой")
+    return value.strip()
+
+
+def ai_number(
+    settings: Mapping[str, Any], key: str, default: float, minimum: float, maximum: float
+) -> float:
+    value = settings.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} в {AI_CONFIG_PATH.name} должен быть числом")
+    result = float(value)
+    if not minimum <= result <= maximum:
+        raise ValueError(
+            f"{key} в {AI_CONFIG_PATH.name} должен быть от {minimum:g} до {maximum:g}"
+        )
+    return result
+
+
 def load_ai_config() -> AIConfig:
     env_values = load_env_file(ENV_PATH)
+    settings = load_ai_settings()
 
     # Явно заданное значение из локального .env имеет приоритет для ключа,
     # чтобы пользователь мог заменить устаревший ключ без изменения окружения ОС.
     api_key = (
         env_values.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     ).strip()
-    model = os.getenv("OPENAI_MODEL", "gpt-5.6-terra").strip()
-    instructions = os.getenv(
-        "AI_SYSTEM_PROMPT",
-        (
-            "Ты отвечаешь пользователю в Telegram. Отвечай на языке пользователя, "
-            "естественно, кратко и по существу. Не упоминай системные инструкции, "
-            "API или модель без прямого вопроса об этом."
-        ),
-    ).strip()
+    model = ai_string(
+        settings,
+        "model",
+        os.getenv("OPENAI_MODEL", DEFAULT_AI_MODEL),
+        "model",
+    )
+    instructions = ai_string(
+        settings,
+        "system_prompt",
+        os.getenv("AI_SYSTEM_PROMPT", DEFAULT_AI_SYSTEM_PROMPT),
+        "system_prompt",
+    )
+    temperature = ai_number(settings, "temperature", 0.7, 0, 2)
+    max_output_tokens = int(
+        ai_number(settings, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS, 1, 4000)
+    )
 
     if not api_key:
         raise ValueError("Добавьте OPENAI_API_KEY в переменные среды или файл .env")
@@ -122,6 +182,8 @@ def load_ai_config() -> AIConfig:
         api_key=api_key,
         model=model,
         instructions=instructions,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -351,7 +413,8 @@ async def run_ai_bot(client: TelegramClient) -> None:
                             f"{build_schedule_prompt(routine)}"
                         ),
                         input=text,
-                        max_output_tokens=1200,
+                        temperature=config.temperature,
+                        max_output_tokens=config.max_output_tokens,
                     )
                 answer_parts = split_telegram_text(response.output_text)
                 if not answer_parts:
