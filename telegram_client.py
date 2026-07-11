@@ -591,7 +591,6 @@ class MilanaMessageResponder:
             randint=randint,
         )
         self._chat_locks: dict[int | str, asyncio.Lock] = {}
-        self._generation_lock = asyncio.Lock()
         self._supports_temperature: bool | None = None
 
     async def _import_existing_history(
@@ -1127,15 +1126,14 @@ class MilanaMessageResponder:
             )
 
             await self._wait_for_full_online_window()
-            async with self._generation_lock:
-                answer = await self._generate_answer(
-                    chat_key=chat_key,
-                    message_id=event.id,
-                    sender_name=sender_name,
-                    text=stored_text,
-                    history_input=history_input,
-                    image_data_url=image_data_url,
-                )
+            answer = await self._generate_answer(
+                chat_key=chat_key,
+                message_id=event.id,
+                sender_name=sender_name,
+                text=stored_text,
+                history_input=history_input,
+                image_data_url=image_data_url,
+            )
 
             answer_parts = split_telegram_text(answer)
             if not answer_parts:

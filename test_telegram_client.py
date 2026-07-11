@@ -221,6 +221,47 @@ class SplitTelegramTextTests(unittest.TestCase):
 
 
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_different_chats_generate_answers_concurrently(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        both_generations_started = asyncio.Event()
+        release_generations = asyncio.Event()
+        started_chats: set[str] = set()
+
+        async def generate_after_both_started(**kwargs):
+            started_chats.add(str(kwargs["input"][-1]["content"]))
+            if len(started_chats) == 2:
+                both_generations_started.set()
+            await release_generations.wait()
+            return SimpleNamespace(output_text="Готовый ответ", output=[])
+
+        openai_client.responses.create.side_effect = generate_after_both_started
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        responder._import_existing_history = AsyncMock()
+
+        first = make_event(clock.value, text="Чат A", chat_id=100, message_id=300)
+        second = make_event(
+            clock.value,
+            text="Чат B",
+            chat_id=200,
+            sender_id=201,
+            message_id=301,
+        )
+        tasks = [
+            asyncio.create_task(responder.process(first)),
+            asyncio.create_task(responder.process(second)),
+        ]
+        try:
+            with patch("builtins.print"):
+                await asyncio.wait_for(both_generations_started.wait(), timeout=1)
+                self.assertEqual(len(started_chats), 2)
+                release_generations.set()
+                await asyncio.gather(*tasks)
+        finally:
+            release_generations.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_waits_before_reading_and_uses_current_schedule_prompt(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)
