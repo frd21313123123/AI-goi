@@ -46,10 +46,6 @@ DEFAULT_AI_SYSTEM_PROMPT = (
     "API или модель без прямого вопроса об этом."
 )
 DEFAULT_MAX_OUTPUT_TOKENS = 1200
-ONLINE_RESPONSE_MIN_SECONDS = 1
-ONLINE_RESPONSE_MAX_SECONDS = 10
-POST_REPLY_ONLINE_MIN_SECONDS = 30
-POST_REPLY_ONLINE_MAX_SECONDS = 60
 SYSTEM_RANDOM = random.SystemRandom()
 SUPPORTED_IMAGE_MIME_TYPES = {
     "image/gif",
@@ -453,9 +449,10 @@ class MilanaPresenceController:
             self._active_responses = max(0, self._active_responses - 1)
             online_seconds: int | None = None
             if answered:
+                behavior = self.routine.online_behavior
                 online_seconds = self._randint(
-                    POST_REPLY_ONLINE_MIN_SECONDS,
-                    POST_REPLY_ONLINE_MAX_SECONDS,
+                    behavior.post_reply_online_min_seconds,
+                    behavior.post_reply_online_max_seconds,
                 )
                 candidate = self.current_time() + timedelta(seconds=online_seconds)
                 if self._online_until is None or candidate > self._online_until:
@@ -755,9 +752,10 @@ class MilanaMessageResponder:
         received_while_online: bool,
     ) -> datetime | None:
         if received_while_online:
+            behavior = self.routine.online_behavior
             fast_delay = self._randint(
-                ONLINE_RESPONSE_MIN_SECONDS,
-                ONLINE_RESPONSE_MAX_SECONDS,
+                behavior.online_response_min_seconds,
+                behavior.online_response_max_seconds,
             )
             fast_target = received_at + timedelta(seconds=fast_delay)
             print(
@@ -815,7 +813,7 @@ class MilanaMessageResponder:
             if (
                 not next_is_sleep
                 or seconds_to_next is None
-                or seconds_to_next >= POST_REPLY_ONLINE_MAX_SECONDS
+                or seconds_to_next >= self.routine.online_behavior.sleep_buffer_seconds
             ):
                 return
             plan = self.routine.plan_response(state.next_at, randint=self._randint)

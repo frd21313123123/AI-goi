@@ -1,9 +1,11 @@
 import json
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
 from milana_schedule import (
     Activity,
+    OnlineBehavior,
     ResponsePolicy,
     SCHEDULE_PATH,
     WeeklyRoutine,
@@ -248,6 +250,45 @@ class MilanaScheduleTests(unittest.TestCase):
             self.routine.response_policy_at(sleeping_at).label,
             "не читает и не отвечает",
         )
+
+    def test_online_behavior_is_loaded_and_validated(self) -> None:
+        self.assertEqual(
+            self.routine.online_behavior,
+            OnlineBehavior(
+                online_response_min_seconds=1,
+                online_response_max_seconds=10,
+                post_reply_online_min_seconds=30,
+                post_reply_online_max_seconds=60,
+                sleep_buffer_seconds=60,
+            ),
+        )
+
+        invalid_updates = (
+            (
+                lambda behavior: behavior.update(
+                    online_response_min_seconds=11,
+                    online_response_max_seconds=10,
+                ),
+                "online_response_min_seconds не может быть больше",
+            ),
+            (
+                lambda behavior: behavior.update(
+                    post_reply_online_min_seconds=61,
+                    post_reply_online_max_seconds=60,
+                ),
+                "post_reply_online_min_seconds не может быть больше",
+            ),
+            (
+                lambda behavior: behavior.update(sleep_buffer_seconds=59),
+                "sleep_buffer_seconds должен быть не меньше",
+            ),
+        )
+        for update, expected_error in invalid_updates:
+            with self.subTest(expected_error=expected_error):
+                config = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
+                update(config["online_behavior"])
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    WeeklyRoutine(config)
 
     def test_time_parsing_and_cross_midnight_activity_boundaries(self) -> None:
         self.assertEqual(time_to_minutes("00:00"), 0)
