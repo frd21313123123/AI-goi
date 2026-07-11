@@ -26,6 +26,7 @@ from telegram_client import (
     normalize_target,
     positive_int,
     split_telegram_text,
+    telegram_image_mime_type,
 )
 
 
@@ -91,13 +92,20 @@ def make_event(
     chat_id: int = 100,
     sender_id: int = 200,
     message_id: int = 300,
+    photo: bool = False,
+    mime_type: str | None = None,
+    image_bytes: bytes = b"test-image",
 ):
+    message = SimpleNamespace(date=value, photo=object() if photo else None)
+    message.download_media = AsyncMock(return_value=image_bytes)
     event = SimpleNamespace(
         chat_id=chat_id,
         sender_id=sender_id,
         id=message_id,
         raw_text=text,
-        message=SimpleNamespace(date=value),
+        photo=message.photo,
+        file=SimpleNamespace(mime_type=mime_type) if mime_type else None,
+        message=message,
         get_input_chat=AsyncMock(return_value="peer"),
         get_sender=AsyncMock(return_value=None),
         reply=AsyncMock(),
@@ -190,6 +198,27 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(message_text(SimpleNamespace(raw_text="", media=True)), "[медиа без подписи]")
         self.assertEqual(message_text(SimpleNamespace(raw_text="", media=None)), "[служебное сообщение]")
 
+    def test_detects_telegram_photos_and_supported_image_documents(self) -> None:
+        photo = SimpleNamespace(
+            photo=object(),
+            file=None,
+            message=SimpleNamespace(photo=None, file=None),
+        )
+        document = SimpleNamespace(
+            photo=None,
+            file=SimpleNamespace(mime_type="image/png"),
+            message=None,
+        )
+        unsupported = SimpleNamespace(
+            photo=None,
+            file=SimpleNamespace(mime_type="application/pdf"),
+            message=None,
+        )
+
+        self.assertEqual(telegram_image_mime_type(photo), "image/jpeg")
+        self.assertEqual(telegram_image_mime_type(document), "image/png")
+        self.assertIsNone(telegram_image_mime_type(unsupported))
+
 
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_before_reading_and_uses_current_schedule_prompt(self) -> None:
@@ -253,6 +282,42 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         client.send_read_acknowledge.assert_awaited_once()
         openai_client.responses.create.assert_not_awaited()
         event.reply.assert_not_awaited()
+
+    async def test_photo_without_caption_is_sent_to_model_and_gets_reply(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(clock.value, text="", photo=True, image_bytes=b"jpeg")
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        request_input = openai_client.responses.create.await_args.kwargs["input"]
+        content = request_input[-1]["content"]
+        self.assertEqual(
+            content[0],
+            {"type": "input_text", "text": "неизвестно: [фото без подписи]"},
+        )
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertEqual(content[1]["image_url"], "data:image/jpeg;base64,anBlZw==")
+        event.reply.assert_awaited_once_with("Готовый ответ")
+
+    async def test_photo_caption_is_included_with_image(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="Как тебе?",
+            mime_type="image/png",
+            image_bytes=b"png",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["text"], "неизвестно: Как тебе?")
+        self.assertEqual(content[1]["image_url"], "data:image/png;base64,cG5n")
 
     async def test_message_received_while_online_uses_at_most_ten_seconds(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))

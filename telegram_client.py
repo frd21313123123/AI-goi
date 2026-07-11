@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import math
 import os
@@ -50,6 +51,12 @@ ONLINE_RESPONSE_MAX_SECONDS = 10
 POST_REPLY_ONLINE_MIN_SECONDS = 30
 POST_REPLY_ONLINE_MAX_SECONDS = 60
 SYSTEM_RANDOM = random.SystemRandom()
+SUPPORTED_IMAGE_MIME_TYPES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
 
 
 @dataclass(frozen=True)
@@ -289,6 +296,37 @@ def message_text(message: Any) -> str:
     if message.media:
         return "[медиа без подписи]"
     return "[служебное сообщение]"
+
+
+def telegram_image_mime_type(event: Any) -> str | None:
+    """Возвращает MIME-тип поддерживаемого изображения из Telegram-события."""
+    message = getattr(event, "message", None)
+    photo = getattr(event, "photo", None) or getattr(message, "photo", None)
+    file_info = getattr(event, "file", None) or getattr(message, "file", None)
+    mime_type = getattr(file_info, "mime_type", None)
+
+    # Обычные Telegram-фото всегда отдаются как JPEG, даже если у File нет MIME.
+    if photo is not None:
+        return mime_type if mime_type in SUPPORTED_IMAGE_MIME_TYPES else "image/jpeg"
+    if mime_type in SUPPORTED_IMAGE_MIME_TYPES:
+        return mime_type
+    return None
+
+
+async def telegram_image_data_url(event: Any, mime_type: str) -> str:
+    """Скачивает Telegram-изображение в память и кодирует для Responses API."""
+    message = getattr(event, "message", None)
+    download_media = getattr(message, "download_media", None)
+    if not callable(download_media):
+        download_media = getattr(event, "download_media", None)
+    if not callable(download_media):
+        raise ValueError("Telegram не предоставил способ скачать изображение")
+
+    image_bytes = await download_media(file=bytes)
+    if not isinstance(image_bytes, bytes) or not image_bytes:
+        raise ValueError("Не удалось скачать изображение из Telegram")
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 async def print_message(message: Any) -> None:
@@ -639,6 +677,7 @@ class MilanaMessageResponder:
         sender_name: str,
         text: str,
         history_input: list[dict[str, str]],
+        image_data_url: str | None = None,
     ) -> str:
         instructions = (
             f"{self.config.instructions}\n\n"
@@ -646,7 +685,19 @@ class MilanaMessageResponder:
             f"{self.memory.diary_instructions()}"
         )
         input_items: list[Any] = [*history_input]
-        input_items.append({"role": "user", "content": f"{sender_name}: {text}"})
+        current_text = f"{sender_name}: {text}"
+        if image_data_url is None:
+            input_items.append({"role": "user", "content": current_text})
+        else:
+            input_items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": current_text},
+                        {"type": "input_image", "image_url": image_data_url},
+                    ],
+                }
+            )
 
         for _ in range(4):
             response = await self._create_model_response(
@@ -830,11 +881,17 @@ class MilanaMessageResponder:
                 )
 
             text = (event.raw_text or "").strip()
-            if not text:
+            image_mime_type = telegram_image_mime_type(event)
+            if not text and image_mime_type is None:
                 print(
                     f"Прочитано и пропущено сообщение без текста, message_id={event.id}"
                 )
                 return
+
+            image_data_url: str | None = None
+            if image_mime_type is not None:
+                image_data_url = await telegram_image_data_url(event, image_mime_type)
+            stored_text = text or "[фото без подписи]"
 
             try:
                 sender = await event.get_sender()
@@ -856,7 +913,7 @@ class MilanaMessageResponder:
             is_new = self.memory.add_message(
                 chat_key,
                 "user",
-                text,
+                stored_text,
                 telegram_message_id=event.id,
                 sender_name=sender_name,
                 created_at=received_at.isoformat(),
@@ -874,8 +931,9 @@ class MilanaMessageResponder:
                     chat_key=chat_key,
                     message_id=event.id,
                     sender_name=sender_name,
-                    text=text,
+                    text=stored_text,
                     history_input=history_input,
+                    image_data_url=image_data_url,
                 )
 
             answer_parts = split_telegram_text(answer)
@@ -967,7 +1025,7 @@ async def run_ai_bot(client: TelegramClient) -> None:
     own_label = f"@{me.username}" if me.username else str(me.id)
     print(
         f"ИИ-бот запущен для аккаунта {own_label}: отвечаю на все входящие "
-        f"текстовые сообщения, модель={config.model}. "
+        f"текстовые сообщения и фото, модель={config.model}. "
         "Для остановки нажмите Ctrl+C."
     )
     print(format_current_status(routine, brief=True))

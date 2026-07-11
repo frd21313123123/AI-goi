@@ -64,6 +64,13 @@ DEFAULT_RESPONSE_BEHAVIOR: Mapping[str, Any] = {
     },
     "by_title": {},
 }
+DEFAULT_ONLINE_BEHAVIOR: Mapping[str, int] = {
+    "online_response_min_seconds": 1,
+    "online_response_max_seconds": 10,
+    "post_reply_online_min_seconds": 30,
+    "post_reply_online_max_seconds": 60,
+    "sleep_buffer_seconds": 60,
+}
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,15 @@ class ResponsePlan:
     received_at: datetime
     respond_at: datetime
     policy: ResponsePolicy
+
+
+@dataclass(frozen=True)
+class OnlineBehavior:
+    online_response_min_seconds: int
+    online_response_max_seconds: int
+    post_reply_online_min_seconds: int
+    post_reply_online_max_seconds: int
+    sleep_buffer_seconds: int
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -287,6 +303,53 @@ def _load_response_behavior(
             raw_policy, f"response_behavior.by_title.{title}"
         )
     return default, by_kind, by_title
+
+
+def _load_online_behavior(value: Any) -> OnlineBehavior:
+    data = _mapping(value, "online_behavior")
+    expected = set(DEFAULT_ONLINE_BEHAVIOR)
+    unknown = set(data) - expected
+    missing = expected - set(data)
+    if unknown:
+        raise ValueError(
+            "Неизвестные поля в online_behavior: "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    if missing:
+        raise ValueError(
+            "Не заданы поля в online_behavior: "
+            + ", ".join(sorted(missing))
+        )
+
+    values = {
+        key: _response_delay(data, key, "online_behavior")
+        for key in DEFAULT_ONLINE_BEHAVIOR
+    }
+    if (
+        values["online_response_min_seconds"]
+        > values["online_response_max_seconds"]
+    ):
+        raise ValueError(
+            "online_behavior.online_response_min_seconds не может быть больше "
+            "online_response_max_seconds"
+        )
+    if (
+        values["post_reply_online_min_seconds"]
+        > values["post_reply_online_max_seconds"]
+    ):
+        raise ValueError(
+            "online_behavior.post_reply_online_min_seconds не может быть больше "
+            "post_reply_online_max_seconds"
+        )
+    if (
+        values["sleep_buffer_seconds"]
+        < values["post_reply_online_max_seconds"]
+    ):
+        raise ValueError(
+            "online_behavior.sleep_buffer_seconds должен быть не меньше "
+            "post_reply_online_max_seconds"
+        )
+    return OnlineBehavior(**values)
 
 
 def time_to_minutes(value: Any, label: str = "время") -> int:
@@ -472,6 +535,9 @@ class WeeklyRoutine:
             self.response_policies_by_title,
         ) = _load_response_behavior(
             config.get("response_behavior", DEFAULT_RESPONSE_BEHAVIOR)
+        )
+        self.online_behavior = _load_online_behavior(
+            config.get("online_behavior", DEFAULT_ONLINE_BEHAVIOR)
         )
         self.custom_events = self._load_custom_events(
             config.get("custom_events", {})
