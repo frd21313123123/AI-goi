@@ -13,6 +13,7 @@ from milana_schedule import load_routine
 from telegram_client import (
     AIConfig,
     MilanaMessageResponder,
+    MilanaPresenceController,
     ai_positive_int,
     load_ai_settings,
     split_telegram_text,
@@ -43,8 +44,9 @@ class AdvancingClock:
         self.value += timedelta(seconds=seconds)
 
 
-def make_responder(clock: AdvancingClock, *, memory=None):
+def make_responder(clock: AdvancingClock, *, memory=None, randint=None):
     client = MagicMock()
+    client.side_effect = AsyncMock(return_value=None)
     client.send_read_acknowledge = AsyncMock()
     client.send_message = AsyncMock()
     client.action.return_value = AsyncContext()
@@ -68,7 +70,7 @@ def make_responder(clock: AdvancingClock, *, memory=None):
         memory=memory,
         now=clock.now,
         sleep=clock.sleep,
-        randint=lambda minimum, maximum: minimum,
+        randint=randint or (lambda minimum, maximum: minimum),
     )
     return responder, client, openai_client
 
@@ -190,6 +192,41 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         client.send_read_acknowledge.assert_awaited_once()
         openai_client.responses.create.assert_not_awaited()
         event.reply.assert_not_awaited()
+
+    async def test_message_received_while_online_uses_at_most_ten_seconds(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, _ = make_responder(
+            clock,
+            randint=lambda minimum, maximum: maximum,
+        )
+
+        with patch("builtins.print"):
+            await responder.process(make_event(clock.value, message_id=300))
+            await responder.process(make_event(clock.value, message_id=301))
+
+        self.assertEqual(clock.delays, [60, 10])
+
+    async def test_answer_keeps_presence_online_for_thirty_to_sixty_seconds(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        client = MagicMock()
+        client.side_effect = AsyncMock(return_value=None)
+        presence = MilanaPresenceController(
+            client,
+            load_routine(),
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=lambda minimum, maximum: maximum,
+        )
+
+        with patch("builtins.print"):
+            await presence.begin_response()
+            seconds = await presence.finish_response(answered=True)
+
+        self.assertEqual(seconds, 60)
+        self.assertTrue(presence.is_online())
+        self.assertEqual(presence.online_until, clock.value + timedelta(seconds=60))
+        clock.value += timedelta(seconds=60)
+        self.assertFalse(presence.is_online())
 
     async def test_second_message_receives_history_from_the_same_chat(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))

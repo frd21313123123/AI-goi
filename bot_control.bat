@@ -30,7 +30,7 @@ cls
 title Milana AI control
 echo Milana AI control
 echo.
-call "%ROOT%show_schedule.bat"
+call :show_full_status
 echo.
 echo 1. Start bot
 echo 2. Stop bot
@@ -82,7 +82,7 @@ echo Bot started. PID: %BOT_PID%
 echo Output log: %OUT_LOG%
 echo Error log: %ERR_LOG%
 echo.
-call "%ROOT%show_schedule.bat"
+call :show_full_status
 goto action_done
 
 :stop
@@ -91,7 +91,7 @@ if not defined BOT_PIDS (
     if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
     echo Bot is not running.
     echo.
-    call "%ROOT%show_schedule.bat"
+    call :show_full_status
     goto action_done
 )
 
@@ -101,22 +101,47 @@ for %%P in (%BOT_PIDS%) do (
 del /q "%PID_FILE%" >nul 2>&1
 echo Bot stopped. PID(s):%BOT_PIDS%
 echo.
-call "%ROOT%show_schedule.bat"
+call :show_full_status
 goto action_done
 
 :status
+call :show_full_status
+goto action_done
+
+:show_full_status
 call :find_bot_pids
 if not defined BOT_PIDS (
     if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
-    echo Bot status: stopped.
-    echo.
-    call "%ROOT%show_schedule.bat"
-    goto action_done
+    echo ============================================================
+    echo MILANA: NOT RUNNING
+    echo ============================================================
+) else (
+    echo ============================================================
+    echo MILANA: RUNNING. PIDs:%BOT_PIDS%
+    echo ============================================================
+    for %%P in (%BOT_PIDS%) do call :show_process_details %%P
 )
-echo Bot status: running. PID(s):%BOT_PIDS%
 echo.
-call "%ROOT%show_schedule.bat"
-goto action_done
+call :show_log_status
+echo.
+echo ---------------- CURRENT DETAILED STATE ----------------
+if not exist "%PYTHON%" (
+    echo State unavailable: Python environment not found: %PYTHON%
+) else if not exist "%SCHEDULE_SCRIPT%" (
+    echo State unavailable: schedule script not found: %SCHEDULE_SCRIPT%
+) else (
+    "%PYTHON%" "%SCHEDULE_SCRIPT%"
+    if errorlevel 1 echo Failed to read Milana state.
+)
+exit /b 0
+
+:show_process_details
+"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-Process -Id %~1 -ErrorAction SilentlyContinue; if (-not $p) { Write-Host 'Process details unavailable.'; exit }; $now = Get-Date; $uptime = $now - $p.StartTime; $uptimeText = if ($uptime.Days -gt 0) { '{0} d {1:00}:{2:00}:{3:00}' -f $uptime.Days,$uptime.Hours,$uptime.Minutes,$uptime.Seconds } else { '{0:00}:{1:00}:{2:00}' -f ([int]$uptime.TotalHours),$uptime.Minutes,$uptime.Seconds }; Write-Host ('Process:      {0} (PID {1})' -f $p.ProcessName,$p.Id); Write-Host ('Started:      {0:dd.MM.yyyy HH:mm:ss}' -f $p.StartTime); Write-Host ('Uptime:       {0}' -f $uptimeText); Write-Host ('CPU time:     {0:N1} sec' -f $p.CPU); Write-Host ('Memory:       {0:N1} MB RAM' -f ($p.WorkingSet64 / 1MB)); Write-Host ('Threads:      {0}' -f $p.Threads.Count)"
+exit /b 0
+
+:show_log_status
+"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$out = Get-Item -LiteralPath '%OUT_LOG%' -ErrorAction SilentlyContinue; $err = Get-Item -LiteralPath '%ERR_LOG%' -ErrorAction SilentlyContinue; Write-Host 'Logs:'; if ($out) { Write-Host ('  Output: {0:N0} bytes, updated {1:dd.MM.yyyy HH:mm:ss}' -f $out.Length,$out.LastWriteTime) } else { Write-Host '  Output: not created yet' }; if ($err) { $label = if ($err.Length -gt 0) { 'HAS ERRORS' } else { 'empty (no recorded errors)' }; Write-Host ('  Errors: {0:N0} bytes, updated {1:dd.MM.yyyy HH:mm:ss} - {2}' -f $err.Length,$err.LastWriteTime,$label) } else { Write-Host '  Errors: not created yet' }; if ($out -and $out.Length -gt 0) { Write-Host 'Recent events:'; Get-Content -Encoding UTF8 -LiteralPath $out.FullName -Tail 3 | ForEach-Object { Write-Host ('  ' + $_) } }; if ($err -and $err.Length -gt 0) { Write-Host 'Recent errors:'; Get-Content -Encoding UTF8 -LiteralPath $err.FullName -Tail 5 | ForEach-Object { Write-Host ('  ' + $_) } }"
+exit /b 0
 
 :logs
 if exist "%ERR_LOG%" (

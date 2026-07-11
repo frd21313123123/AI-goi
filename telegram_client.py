@@ -10,7 +10,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -45,6 +45,10 @@ DEFAULT_AI_SYSTEM_PROMPT = (
     "API или модель без прямого вопроса об этом."
 )
 DEFAULT_MAX_OUTPUT_TOKENS = 1200
+ONLINE_RESPONSE_MIN_SECONDS = 1
+ONLINE_RESPONSE_MAX_SECONDS = 10
+POST_REPLY_ONLINE_MIN_SECONDS = 30
+POST_REPLY_ONLINE_MAX_SECONDS = 60
 SYSTEM_RANDOM = random.SystemRandom()
 
 
@@ -346,26 +350,97 @@ async def listen_messages(client: TelegramClient, target: str | None) -> None:
     await client.run_until_disconnected()
 
 
-async def keep_schedule_presence(
-    client: TelegramClient,
-    routine: WeeklyRoutine,
-    interval: int = 60,
-) -> None:
-    """Держит аккаунт офлайн во сне и доступным в остальное время."""
-    last_offline: bool | None = None
-    while True:
-        offline = not routine.response_policy_at().available
-        if offline != last_offline:
-            try:
-                await client(functions.account.UpdateStatusRequest(offline=offline))
-                last_offline = offline
-            except (RPCError, OSError) as exc:
-                label = "не в сети" if offline else "в сети"
-                print(
-                    f"Не удалось обновить статус «{label}»: {exc}",
-                    file=sys.stderr,
+class MilanaPresenceController:
+    """Управляет короткими и правдоподобными окнами статуса «в сети»."""
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        routine: WeeklyRoutine,
+        *,
+        now: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        randint: Callable[[int, int], int] = SYSTEM_RANDOM.randint,
+    ) -> None:
+        self.client = client
+        self.routine = routine
+        self._now = now
+        self._sleep = sleep
+        self._randint = randint
+        self._online_until: datetime | None = None
+        self._active_responses = 0
+        self._last_offline: bool | None = None
+        self._lock = asyncio.Lock()
+
+    def current_time(self) -> datetime:
+        value = self._now() if self._now is not None else None
+        return self.routine.normalize_datetime(value)
+
+    @property
+    def online_until(self) -> datetime | None:
+        return self._online_until
+
+    def is_online(self, value: datetime | None = None) -> bool:
+        moment = self.routine.normalize_datetime(value) if value else self.current_time()
+        if not self.routine.response_policy_at(moment).available:
+            return False
+        grace_is_active = (
+            self._online_until is not None and moment < self._online_until
+        )
+        return self._active_responses > 0 or grace_is_active
+
+    async def _publish_locked(self) -> None:
+        offline = not self.is_online()
+        if offline == self._last_offline:
+            return
+        try:
+            await self.client(functions.account.UpdateStatusRequest(offline=offline))
+            self._last_offline = offline
+        except (RPCError, OSError) as exc:
+            label = "не в сети" if offline else "в сети"
+            print(
+                f"Не удалось обновить статус «{label}»: {exc}",
+                file=sys.stderr,
+            )
+
+    async def begin_response(self) -> None:
+        """Сразу показывает online перед чтением и отправкой ответа."""
+        async with self._lock:
+            self._active_responses += 1
+            await self._publish_locked()
+
+    async def finish_response(self, *, answered: bool) -> int | None:
+        """После ответа оставляет аккаунт online на случайные 30–60 секунд."""
+        async with self._lock:
+            self._active_responses = max(0, self._active_responses - 1)
+            online_seconds: int | None = None
+            if answered:
+                online_seconds = self._randint(
+                    POST_REPLY_ONLINE_MIN_SECONDS,
+                    POST_REPLY_ONLINE_MAX_SECONDS,
                 )
-        await asyncio.sleep(interval)
+                candidate = self.current_time() + timedelta(seconds=online_seconds)
+                if self._online_until is None or candidate > self._online_until:
+                    self._online_until = candidate
+            await self._publish_locked()
+            return online_seconds
+
+    async def run(self, interval: float = 1.0) -> None:
+        """Обновляет offline после завершения гарантированного online-окна."""
+        while True:
+            async with self._lock:
+                await self._publish_locked()
+            await self._sleep(interval)
+
+    async def force_offline(self) -> None:
+        async with self._lock:
+            self._active_responses = 0
+            self._online_until = None
+            try:
+                await self.client(functions.account.UpdateStatusRequest(offline=True))
+                self._last_offline = True
+            except (RPCError, OSError) as exc:
+                print(f"Не удалось выставить статус «не в сети»: {exc}", file=sys.stderr)
 
 
 def split_telegram_text(text: str, limit: int = 4000) -> list[str]:
@@ -399,6 +474,7 @@ class MilanaMessageResponder:
         routine: WeeklyRoutine,
         *,
         memory: MilanaMemoryStore | None = None,
+        presence: MilanaPresenceController | None = None,
         history_limit: int = DEFAULT_HISTORY_LIMIT,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -413,6 +489,13 @@ class MilanaMessageResponder:
         self._now = now
         self._sleep = sleep
         self._randint = randint
+        self.presence = presence or MilanaPresenceController(
+            client,
+            routine,
+            now=now,
+            sleep=sleep,
+            randint=randint,
+        )
         self._chat_locks: dict[int | str, asyncio.Lock] = {}
         self._generation_lock = asyncio.Lock()
         self._supports_temperature: bool | None = None
@@ -614,7 +697,26 @@ class MilanaMessageResponder:
         if delay > 0:
             await self._sleep(delay)
 
-    async def _wait_before_reading(self, received_at: datetime) -> None:
+    async def _wait_before_reading(
+        self,
+        received_at: datetime,
+        *,
+        received_while_online: bool,
+    ) -> datetime | None:
+        if received_while_online:
+            fast_delay = self._randint(
+                ONLINE_RESPONSE_MIN_SECONDS,
+                ONLINE_RESPONSE_MAX_SECONDS,
+            )
+            fast_target = received_at + timedelta(seconds=fast_delay)
+            print(
+                "Сообщение получено, пока Милана в сети; "
+                f"ответ будет отправлен не позднее чем через {fast_delay} сек."
+            )
+            now = self.current_time()
+            if self.routine.response_policy_at(now).available:
+                return fast_target
+
         plan = self.routine.plan_response(received_at, randint=self._randint)
         while True:
             now = self.current_time()
@@ -626,7 +728,7 @@ class MilanaMessageResponder:
             await self._sleep_until(plan.respond_at)
             now = self.current_time()
             if self.routine.response_policy_at(now).available:
-                return
+                return None
 
             # Системные часы или расписание могли измениться во время ожидания.
             # Во сне по-прежнему ничего не читаем и строим новый план от «сейчас».
@@ -644,25 +746,69 @@ class MilanaMessageResponder:
             )
             await self._sleep_until(plan.respond_at)
 
+    async def _wait_for_full_online_window(self) -> None:
+        """Не начинает ответ, если до сна осталось меньше минуты."""
+        while True:
+            await self._wait_out_sleep()
+            now = self.current_time()
+            state = self.routine.state_at(now)
+            seconds_to_next = (
+                (state.next_at - now).total_seconds()
+                if state.next_at is not None
+                else None
+            )
+            next_is_sleep = (
+                state.next_activity is not None
+                and state.next_activity.kind == "sleep"
+            )
+            if (
+                not next_is_sleep
+                or seconds_to_next is None
+                or seconds_to_next >= POST_REPLY_ONLINE_MAX_SECONDS
+            ):
+                return
+            plan = self.routine.plan_response(state.next_at, randint=self._randint)
+            print(
+                "До сна осталось меньше минуты; ответ перенесён на "
+                f"{plan.respond_at:%d.%m %H:%M:%S}"
+            )
+            await self._sleep_until(plan.respond_at)
+
     async def process(self, event: events.NewMessage.Event) -> None:
         """Последовательно обрабатывает сообщения одного чата, не блокируя другие."""
+        received_at = self.received_time(event)
+        received_while_online = self.presence.is_online(received_at)
         chat_key: int | str = event.chat_id
         if chat_key is None:
             chat_key = str(event.sender_id or "unknown")
         chat_lock = self._chat_locks.setdefault(chat_key, asyncio.Lock())
 
         async with chat_lock:
-            await self._process_locked(event)
+            await self._process_locked(
+                event,
+                received_at=received_at,
+                received_while_online=received_while_online,
+            )
 
-    async def _process_locked(self, event: events.NewMessage.Event) -> None:
-        received_at = self.received_time(event)
+    async def _process_locked(
+        self,
+        event: events.NewMessage.Event,
+        *,
+        received_at: datetime,
+        received_while_online: bool,
+    ) -> None:
         print(
             f"Получено входящее сообщение: chat_id={event.chat_id}, "
             f"message_id={event.id}; ожидаю подходящего момента для чтения"
         )
 
+        presence_started = False
+        answered = False
         try:
-            await self._wait_before_reading(received_at)
+            fast_send_at = await self._wait_before_reading(
+                received_at,
+                received_while_online=received_while_online,
+            )
 
             action_target: Any = event.chat_id
             read_acknowledged = False
@@ -722,30 +868,34 @@ class MilanaMessageResponder:
                 )
                 return
 
+            await self._wait_for_full_online_window()
             async with self._generation_lock:
-                async with self.client.action(action_target, "typing"):
-                    answer = await self._generate_answer(
-                        chat_key=chat_key,
-                        message_id=event.id,
-                        sender_name=sender_name,
-                        text=text,
-                        history_input=history_input,
-                    )
+                answer = await self._generate_answer(
+                    chat_key=chat_key,
+                    message_id=event.id,
+                    sender_name=sender_name,
+                    text=text,
+                    history_input=history_input,
+                )
 
             answer_parts = split_telegram_text(answer)
             if not answer_parts:
                 raise ValueError("Модель вернула пустой ответ")
 
+            if fast_send_at is not None:
+                await self._sleep_until(fast_send_at)
+            await self.presence.begin_response()
+            presence_started = True
             sent_message_id: int | None = None
-            for index, part in enumerate(answer_parts):
-                await self._wait_out_sleep()
-                if index == 0:
-                    sent = await event.reply(part)
-                else:
-                    sent = await self.client.send_message(event.chat_id, part)
-                candidate_id = getattr(sent, "id", None)
-                if sent_message_id is None and isinstance(candidate_id, int):
-                    sent_message_id = candidate_id
+            async with self.client.action(action_target, "typing"):
+                for index, part in enumerate(answer_parts):
+                    if index == 0:
+                        sent = await event.reply(part)
+                    else:
+                        sent = await self.client.send_message(event.chat_id, part)
+                    candidate_id = getattr(sent, "id", None)
+                    if sent_message_id is None and isinstance(candidate_id, int):
+                        sent_message_id = candidate_id
             self.memory.add_message(
                 chat_key,
                 "assistant",
@@ -753,6 +903,7 @@ class MilanaMessageResponder:
                 telegram_message_id=sent_message_id,
                 sender_name="Милана",
             )
+            answered = True
             print(f"Отправлен ИИ-ответ на message_id={event.id}")
         except (OpenAIError, RPCError, OSError, TypeError, ValueError) as exc:
             print(
@@ -760,6 +911,16 @@ class MilanaMessageResponder:
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
+        finally:
+            if presence_started:
+                online_seconds = await self.presence.finish_response(
+                    answered=answered
+                )
+                if online_seconds is not None:
+                    print(
+                        "После ответа Милана останется в сети ещё "
+                        f"{online_seconds} сек."
+                    )
 
 
 async def run_ai_bot(client: TelegramClient) -> None:
@@ -768,8 +929,14 @@ async def run_ai_bot(client: TelegramClient) -> None:
     openai_client = AsyncOpenAI(api_key=config.api_key)
     memory = MilanaMemoryStore(MEMORY_PATH)
     me = await client.get_me()
+    presence = MilanaPresenceController(client, routine)
     responder = MilanaMessageResponder(
-        client, openai_client, config, routine, memory=memory
+        client,
+        openai_client,
+        config,
+        routine,
+        memory=memory,
+        presence=presence,
     )
     pending_tasks: set[asyncio.Task[None]] = set()
 
@@ -805,7 +972,7 @@ async def run_ai_bot(client: TelegramClient) -> None:
     )
     print(format_current_status(routine, brief=True))
     presence_task = asyncio.create_task(
-        keep_schedule_presence(client, routine),
+        presence.run(),
         name="milana-presence",
     )
     try:
@@ -818,10 +985,7 @@ async def run_ai_bot(client: TelegramClient) -> None:
         presence_task.cancel()
         await asyncio.gather(presence_task, return_exceptions=True)
         if client.is_connected():
-            try:
-                await client(functions.account.UpdateStatusRequest(offline=True))
-            except (RPCError, OSError) as exc:
-                print(f"Не удалось выставить статус «не в сети»: {exc}", file=sys.stderr)
+            await presence.force_offline()
         memory.close()
 
 
