@@ -14,12 +14,14 @@ from openai import BadRequestError
 from milana_schedule import load_routine
 from telegram_client import (
     AIConfig,
+    Config,
     MessageFlowConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
     ai_number,
     ai_positive_int,
     ai_string,
+    build_parser,
     display_name,
     load_env_file,
     load_ai_settings,
@@ -27,6 +29,8 @@ from telegram_client import (
     message_text,
     normalize_target,
     positive_int,
+    run,
+    run_ai_bot,
     split_telegram_text,
     telegram_image_mime_type,
 )
@@ -79,6 +83,7 @@ def structured_response(*messages: str, output=None):
 def make_responder(
     clock: AdvancingClock,
     *,
+    dev_chat: bool = False,
     memory=None,
     randint=None,
     message_flow: MessageFlowConfig | None = None,
@@ -106,6 +111,7 @@ def make_responder(
         openai_client,
         config,
         load_routine(),
+        dev_chat=dev_chat,
         memory=memory,
         now=clock.now,
         sleep=clock.sleep,
@@ -143,6 +149,12 @@ def make_event(
 
 
 class SplitTelegramTextTests(unittest.TestCase):
+    def test_ai_bot_dev_chat_flag_defaults_off_and_can_be_enabled(self) -> None:
+        parser = build_parser()
+
+        self.assertFalse(parser.parse_args(["ai-bot"]).dev_chat)
+        self.assertTrue(parser.parse_args(["ai-bot", "--dev-chat"]).dev_chat)
+
     def test_empty_text_returns_no_parts(self) -> None:
         self.assertEqual(split_telegram_text("   \n"), [])
 
@@ -288,7 +300,128 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertIsNone(telegram_image_mime_type(unsupported))
 
 
+class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_forwards_dev_chat_flag_to_ai_bot(self) -> None:
+        args = build_parser().parse_args(["ai-bot", "--dev-chat"])
+        config = Config(
+            api_id=123,
+            api_hash="a" * 32,
+            session_path=Path("test-session"),
+        )
+        client = MagicMock()
+        client.start = AsyncMock()
+        client.disconnect = AsyncMock()
+
+        with (
+            patch("telegram_client.load_config", return_value=config),
+            patch("telegram_client.TelegramClient", return_value=client),
+            patch("telegram_client.run_ai_bot", new_callable=AsyncMock) as ai_bot,
+        ):
+            await run(args)
+
+        ai_bot.assert_awaited_once_with(client, dev_chat=True)
+        client.start.assert_awaited_once()
+        client.disconnect.assert_awaited_once()
+
+    async def test_dev_chat_runtime_does_not_start_presence_simulation(self) -> None:
+        client = MagicMock()
+        client.get_me = AsyncMock(return_value=SimpleNamespace(username="milana", id=1))
+        client.run_until_disconnected = AsyncMock()
+        client.is_connected.return_value = False
+        config = AIConfig(
+            api_key="test-key",
+            model="test-model",
+            instructions="Тестовая инструкция",
+            temperature=0.2,
+            max_output_tokens=100,
+        )
+        routine = load_routine()
+        memory = MagicMock()
+        presence = MagicMock()
+        presence.run = AsyncMock()
+        presence.force_offline = AsyncMock()
+        responder = MagicMock()
+        responder.shutdown = AsyncMock()
+
+        with (
+            patch("telegram_client.load_ai_config", return_value=config),
+            patch("telegram_client.load_routine", return_value=routine),
+            patch("telegram_client.AsyncOpenAI", return_value=MagicMock()),
+            patch("telegram_client.MilanaMemoryStore", return_value=memory),
+            patch(
+                "telegram_client.MilanaPresenceController", return_value=presence
+            ),
+            patch(
+                "telegram_client.MilanaMessageResponder", return_value=responder
+            ) as responder_type,
+            patch("telegram_client.format_current_status") as schedule_status,
+            patch("builtins.print"),
+        ):
+            await run_ai_bot(client, dev_chat=True)
+
+        self.assertTrue(responder_type.call_args.kwargs["dev_chat"])
+        presence.run.assert_not_awaited()
+        presence.force_offline.assert_not_awaited()
+        schedule_status.assert_not_called()
+        responder.shutdown.assert_awaited_once()
+        memory.close.assert_called_once()
+
+
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dev_chat_answers_during_sleep_without_schedule_or_delays(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 2, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=401)
+        client.send_message.return_value = SimpleNamespace(id=402)
+        openai_client.responses.create.return_value = structured_response(
+            "Первая часть", "Вторая часть"
+        )
+        responder.presence.is_online = MagicMock(
+            side_effect=AssertionError("DEV не должен проверять online")
+        )
+        responder.presence.is_sleep_deferred = MagicMock(
+            side_effect=AssertionError("DEV не должен проверять отложенный сон")
+        )
+        responder.presence.can_respond = MagicMock(
+            side_effect=AssertionError("DEV не должен проверять расписание presence")
+        )
+        responder.presence.begin_response = AsyncMock()
+        responder.presence.finish_response = AsyncMock()
+
+        with (
+            patch("telegram_client.build_schedule_prompt") as schedule_prompt,
+            patch.object(
+                responder.routine,
+                "plan_response",
+                side_effect=AssertionError("DEV не должен планировать ответ"),
+            ),
+            patch.object(
+                responder.routine,
+                "state_at",
+                side_effect=AssertionError("DEV не должен читать состояние расписания"),
+            ),
+            patch.object(
+                responder.routine,
+                "response_policy_at",
+                side_effect=AssertionError("DEV не должен читать правила ответа"),
+            ),
+        ):
+            with patch("builtins.print"):
+                await responder.process(event)
+
+        schedule_prompt.assert_not_called()
+        responder.presence.begin_response.assert_not_awaited()
+        responder.presence.finish_response.assert_not_awaited()
+        self.assertEqual(clock.delays, [])
+        client.send_read_acknowledge.assert_awaited_once()
+        openai_client.responses.create.assert_awaited_once()
+        instructions = openai_client.responses.create.await_args.kwargs["instructions"]
+        self.assertIn("режим прямого общения", instructions.lower())
+        self.assertNotIn("актуальный бытовой контекст", instructions.lower())
+        event.reply.assert_awaited_once_with("Первая часть")
+        client.send_message.assert_awaited_once_with(100, "Вторая часть")
+
     async def test_typing_action_covers_generation_and_sending(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)

@@ -10,7 +10,7 @@ import math
 import os
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -328,9 +328,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Необязательно: слушать только этот @username или ID чата",
     )
 
-    subparsers.add_parser(
+    ai_bot = subparsers.add_parser(
         "ai-bot",
         help="Отвечать через OpenAI на все входящие текстовые сообщения",
+    )
+    ai_bot.add_argument(
+        "--dev-chat",
+        action="store_true",
+        help=(
+            "Режим прямого общения: отвечать сразу, без расписания, "
+            "симуляции присутствия и искусственных пауз"
+        ),
     )
 
     schedule = subparsers.add_parser(
@@ -723,7 +731,7 @@ class SendOutcome:
 
 
 class MilanaMessageResponder:
-    """Объединяет входящие по чатам и отвечает в ритме текущего занятия Миланы."""
+    """Обрабатывает входящие по чатам в обычном или прямом dev-режиме."""
 
     def __init__(
         self,
@@ -732,6 +740,7 @@ class MilanaMessageResponder:
         config: AIConfig,
         routine: WeeklyRoutine,
         *,
+        dev_chat: bool = False,
         memory: MilanaMemoryStore | None = None,
         presence: MilanaPresenceController | None = None,
         history_limit: int = DEFAULT_HISTORY_LIMIT,
@@ -743,6 +752,18 @@ class MilanaMessageResponder:
         self.openai_client = openai_client
         self.config = config
         self.routine = routine
+        self.dev_chat = dev_chat
+        self.message_flow = (
+            replace(
+                config.message_flow,
+                input_quiet_seconds=0,
+                input_max_wait_seconds=0,
+                inter_message_min_delay_seconds=0,
+                inter_message_max_delay_seconds=0,
+            )
+            if dev_chat
+            else config.message_flow
+        )
         self.memory = memory or MilanaMemoryStore()
         self.history_limit = history_limit
         self._now = now
@@ -845,7 +866,7 @@ class MilanaMessageResponder:
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "minItems": 1,
-                                "maxItems": self.config.message_flow.max_reply_messages,
+                                "maxItems": self.message_flow.max_reply_messages,
                             }
                         },
                         "required": ["messages"],
@@ -1185,7 +1206,7 @@ class MilanaMessageResponder:
         if any(not isinstance(message, str) for message in raw_messages):
             raise ValueError("Каждая часть структурированного ответа должна быть строкой")
         messages = tuple(message.strip() for message in raw_messages if message.strip())
-        if len(messages) > self.config.message_flow.max_reply_messages:
+        if len(messages) > self.message_flow.max_reply_messages:
             raise ValueError("Модель превысила максимальное число сообщений в ответе")
         if not messages:
             raise ValueError("Модель вернула пустой ответ")
@@ -1198,10 +1219,16 @@ class MilanaMessageResponder:
         history_input: list[dict[str, str]],
         messages: list[PreparedIncoming],
     ) -> GeneratedReply:
-        max_parts = self.config.message_flow.max_reply_messages
+        max_parts = self.message_flow.max_reply_messages
+        context_instructions = (
+            "Включён режим прямого общения для разработки. Не учитывай расписание, "
+            "текущее занятие, сон, статус в сети и связанные с ними правила."
+            if self.dev_chat
+            else build_schedule_prompt(self.routine, self.current_time())
+        )
         instructions = (
             f"{self.config.instructions}\n\n"
-            f"{build_schedule_prompt(self.routine, self.current_time())}\n\n"
+            f"{context_instructions}\n\n"
             f"{self.memory.diary_instructions()}\n\n"
             "Сформируй готовый ответ для Telegram как от Миланы. Самостоятельно реши, "
             f"нужна одна реплика или естественная серия до {max_parts} реплик. "
@@ -1283,6 +1310,8 @@ class MilanaMessageResponder:
         received_while_online: bool,
         continues_conversation: bool,
     ) -> None:
+        if self.dev_chat:
+            return
         if received_while_online or continues_conversation:
             behavior = self.routine.online_behavior
             fast_delay = self._randint(
@@ -1338,6 +1367,8 @@ class MilanaMessageResponder:
         self, *, continues_conversation: bool = False
     ) -> None:
         """Не начинает ответ, если до сна осталось меньше минуты."""
+        if self.dev_chat:
+            return
         while True:
             await self._wait_out_sleep(
                 continues_conversation=continues_conversation
@@ -1391,12 +1422,17 @@ class MilanaMessageResponder:
     async def submit(self, event: events.NewMessage.Event) -> asyncio.Task[None]:
         """Quickly enqueue an event and ensure exactly one worker owns its chat."""
         received_at = self.received_time(event)
+        received_while_online = False
+        continues_conversation = False
+        if not self.dev_chat:
+            received_while_online = self.presence.is_online(received_at)
+            continues_conversation = self.presence.is_sleep_deferred(received_at)
         envelope = IncomingEnvelope(
             event=event,
             received_at=received_at,
             queued_at=self.current_time(),
-            received_while_online=self.presence.is_online(received_at),
-            continues_conversation=self.presence.is_sleep_deferred(received_at),
+            received_while_online=received_while_online,
+            continues_conversation=continues_conversation,
         )
         chat_key = self._chat_key(event)
         message_id = getattr(event, "id", None)
@@ -1502,7 +1538,7 @@ class MilanaMessageResponder:
         self, state: ChatWorkerState
     ) -> list[IncomingEnvelope]:
         """Wait for quiet (within the cap) and atomically claim the pending batch."""
-        flow = self.config.message_flow
+        flow = self.message_flow
         started_at = self.current_time()
         deadline = started_at + timedelta(seconds=flow.input_max_wait_seconds)
         earliest_quiet_end = started_at + timedelta(seconds=flow.input_quiet_seconds)
@@ -1659,6 +1695,8 @@ class MilanaMessageResponder:
             return getattr(event, "chat_id", None)
 
     def _full_online_window_is_open(self, *, continues_conversation: bool) -> bool:
+        if self.dev_chat:
+            return True
         if continues_conversation:
             return True
         now = self.current_time()
@@ -1734,7 +1772,7 @@ class MilanaMessageResponder:
 
         for index, part in enumerate(parts):
             if index > 0:
-                flow = self.config.message_flow
+                flow = self.message_flow
                 minimum_ms = round(flow.inter_message_min_delay_seconds * 1000)
                 maximum_ms = round(flow.inter_message_max_delay_seconds * 1000)
                 delay = self._randint(minimum_ms, maximum_ms) / 1000
@@ -1901,8 +1939,9 @@ class MilanaMessageResponder:
                         if await self._revision(state) != revision:
                             continue
 
-                        await self.presence.begin_response()
-                        presence_started = True
+                        if not self.dev_chat:
+                            await self.presence.begin_response()
+                            presence_started = True
                         outcome = await self._send_generated_reply(
                             state,
                             revision=revision,
@@ -1949,7 +1988,7 @@ class MilanaMessageResponder:
                     self._chat_states.pop(state.chat_key, None)
 
 
-async def run_ai_bot(client: TelegramClient) -> None:
+async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     config = load_ai_config()
     routine = load_routine()
     openai_client = AsyncOpenAI(api_key=config.api_key)
@@ -1961,6 +2000,7 @@ async def run_ai_bot(client: TelegramClient) -> None:
         openai_client,
         config,
         routine,
+        dev_chat=dev_chat,
         memory=memory,
         presence=presence,
     )
@@ -1975,22 +2015,31 @@ async def run_ai_bot(client: TelegramClient) -> None:
         events.NewMessage(incoming=True),
     )
     own_label = f"@{me.username}" if me.username else str(me.id)
-    print(
-        f"ИИ-бот запущен для аккаунта {own_label}: отвечаю на все входящие "
-        f"текстовые сообщения и фото, модель={config.model}. "
-        "Для остановки нажмите Ctrl+C."
-    )
-    print(format_current_status(routine, brief=True))
-    presence_task = asyncio.create_task(
-        presence.run(),
-        name="milana-presence",
-    )
+    if dev_chat:
+        print(
+            f"ИИ-бот запущен для аккаунта {own_label} в режиме DEV-общения: "
+            f"ответы без расписания и искусственных пауз, модель={config.model}. "
+            "Для остановки нажмите Ctrl+C."
+        )
+        presence_task = None
+    else:
+        print(
+            f"ИИ-бот запущен для аккаунта {own_label}: отвечаю на все входящие "
+            f"текстовые сообщения и фото, модель={config.model}. "
+            "Для остановки нажмите Ctrl+C."
+        )
+        print(format_current_status(routine, brief=True))
+        presence_task = asyncio.create_task(
+            presence.run(),
+            name="milana-presence",
+        )
     try:
         await client.run_until_disconnected()
     finally:
         await responder.shutdown()
-        presence_task.cancel()
-        await asyncio.gather(presence_task, return_exceptions=True)
+        if presence_task is not None:
+            presence_task.cancel()
+            await asyncio.gather(presence_task, return_exceptions=True)
         if client.is_connected():
             await presence.force_offline()
         memory.close()
@@ -2021,7 +2070,7 @@ async def run(args: argparse.Namespace) -> None:
         elif args.command == "listen":
             await listen_messages(client, args.target)
         elif args.command == "ai-bot":
-            await run_ai_bot(client)
+            await run_ai_bot(client, dev_chat=args.dev_chat)
     finally:
         await client.disconnect()
 

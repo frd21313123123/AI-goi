@@ -7,6 +7,7 @@ sessions/
 *.session
 *.session-journal
 bot.pid
+bot.mode
 bot-output.log
 bot-error.log
 data/
