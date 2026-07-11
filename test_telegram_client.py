@@ -1,4 +1,6 @@
+import argparse
 import asyncio
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,8 +16,15 @@ from telegram_client import (
     AIConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
+    ai_number,
     ai_positive_int,
+    ai_string,
+    display_name,
+    load_env_file,
     load_ai_settings,
+    message_text,
+    normalize_target,
+    positive_int,
     split_telegram_text,
 )
 
@@ -107,6 +116,10 @@ class SplitTelegramTextTests(unittest.TestCase):
         parts = split_telegram_text("a" * 8001)
         self.assertEqual([len(part) for part in parts], [4000, 4000, 1])
 
+    def test_prefers_newlines_and_spaces_when_splitting(self) -> None:
+        self.assertEqual(split_telegram_text("первая строка\nвторая", 14), ["первая строка", "вторая"])
+        self.assertEqual(split_telegram_text("один два три", 9), ["один два", "три"])
+
     def test_load_ai_settings_reads_json_object(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "ai_config.json"
@@ -128,6 +141,54 @@ class SplitTelegramTextTests(unittest.TestCase):
     def test_max_output_tokens_must_be_an_integer(self) -> None:
         with self.assertRaisesRegex(ValueError, "целым числом"):
             ai_positive_int({"max_output_tokens": 1.5}, "max_output_tokens", 1200)
+
+    def test_config_value_helpers_validate_types_and_ranges(self) -> None:
+        self.assertEqual(ai_string({}, "model", "  default  ", "model"), "default")
+        self.assertEqual(ai_number({"temperature": 1}, "temperature", 0.7, 0, 2), 1.0)
+        with self.assertRaises(ValueError):
+            ai_string({"model": "   "}, "model", "default", "model")
+        for value in (True, float("inf"), -0.1, 2.1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ai_number({"temperature": value}, "temperature", 0.7, 0, 2)
+
+    def test_env_loader_handles_comments_quotes_and_does_not_override_environment(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "# comment\nFIRST='one'\nSECOND=two=three\n",
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"FIRST": "existing"}, clear=False):
+                values = load_env_file(path)
+                self.assertEqual(values, {"FIRST": "one", "SECOND": "two=three"})
+                self.assertEqual(__import__("os").environ["FIRST"], "existing")
+
+            invalid = Path(directory) / "invalid.env"
+            invalid.write_text("BROKEN", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "строка 1"):
+                load_env_file(invalid)
+
+        self.assertEqual(load_env_file(Path(directory) / "missing.env"), {})
+
+    def test_telegram_value_helpers_cover_ids_names_and_message_kinds(self) -> None:
+        self.assertEqual(normalize_target(" -123 "), -123)
+        self.assertEqual(normalize_target(" @name "), "@name")
+        with self.assertRaises(ValueError):
+            normalize_target("   ")
+        self.assertEqual(positive_int("3"), 3)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            positive_int("0")
+        self.assertEqual(display_name(None), "неизвестно")
+        with patch("telegram_client.utils.get_display_name", return_value=""):
+            self.assertEqual(display_name(SimpleNamespace(username="anna", id=7)), "anna")
+            self.assertEqual(display_name(SimpleNamespace(username=None, id=7)), "7")
+        self.assertEqual(
+            message_text(SimpleNamespace(raw_text="a\r\nb", media=None)),
+            "a  ⏎ b",
+        )
+        self.assertEqual(message_text(SimpleNamespace(raw_text="", media=True)), "[медиа без подписи]")
+        self.assertEqual(message_text(SimpleNamespace(raw_text="", media=None)), "[служебное сообщение]")
 
 
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
@@ -403,6 +464,68 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             openai_client.responses.create.await_args_list[1].kwargs,
         )
         event.reply.assert_awaited_once_with("Ответ без temperature")
+
+    async def test_invalid_diary_call_returns_tool_error_without_writing(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, _ = make_responder(clock)
+        call = SimpleNamespace(arguments="not-json")
+
+        result = json.loads(
+            responder._execute_diary_call(call, chat_key=100, source_message_id=5)
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(responder.memory.get_diary(), [])
+
+    async def test_repeated_diary_call_reports_existing_entry(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, _ = make_responder(clock)
+        call = SimpleNamespace(arguments='{"content":"Один факт"}')
+
+        first = json.loads(responder._execute_diary_call(call, chat_key=1, source_message_id=1))
+        second = json.loads(responder._execute_diary_call(call, chat_key=2, source_message_id=2))
+
+        self.assertEqual(first["status"], "stored")
+        self.assertEqual(second["status"], "already_exists")
+
+    async def test_empty_model_answer_is_not_sent_or_stored_as_assistant(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        openai_client.responses.create.return_value = SimpleNamespace(output_text="   ", output=[])
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_not_awaited()
+        self.assertEqual([item.role for item in responder.memory.get_chat_history(100)], ["user"])
+
+    async def test_multi_part_answer_uses_reply_then_send_message(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock)
+        openai_client.responses.create.return_value = SimpleNamespace(
+            output_text="a" * 4001,
+            output=[],
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("a" * 4000)
+        client.send_message.assert_awaited_once_with(100, "a")
+        self.assertEqual(responder.memory.get_chat_history(100)[-1].content, "a" * 4001)
+
+    async def test_read_acknowledgement_failure_still_allows_answer(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, _ = make_responder(clock)
+        client.send_read_acknowledge.side_effect = OSError("offline")
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Готовый ответ")
 
 
 if __name__ == "__main__":

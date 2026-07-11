@@ -2,7 +2,11 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from milana_memory import MAX_DIARY_ENTRY_LENGTH, MilanaMemoryStore
+from milana_memory import (
+    MAX_DIARY_ENTRY_LENGTH,
+    MAX_MESSAGE_LENGTH,
+    MilanaMemoryStore,
+)
 
 
 class MilanaMemoryStoreTests(unittest.TestCase):
@@ -72,10 +76,53 @@ class MilanaMemoryStoreTests(unittest.TestCase):
         store = MilanaMemoryStore()
         with self.assertRaises(ValueError):
             store.add_message(1, "system", "нет")
+        with self.assertRaises(TypeError):
+            store.add_message(1, "user", None)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            store.add_message(1, "user", "x" * (MAX_MESSAGE_LENGTH + 1))
         with self.assertRaises(ValueError):
             store.add_diary_entry("   ")
         with self.assertRaises(ValueError):
             store.add_diary_entry("x" * (MAX_DIARY_ENTRY_LENGTH + 1))
+        store.close()
+
+    def test_empty_store_and_non_positive_limits(self) -> None:
+        store = MilanaMemoryStore()
+
+        self.assertFalse(store.has_chat_history("missing"))
+        self.assertIsNone(store.latest_telegram_message_id("missing"))
+        self.assertEqual(store.get_chat_history("missing", limit=0), [])
+        self.assertEqual(store.get_diary(limit=-1), [])
+        self.assertIn("Дневник пока пуст", store.diary_instructions())
+
+        store.close()
+
+    def test_latest_message_id_ignores_local_turns_without_telegram_id(self) -> None:
+        store = MilanaMemoryStore()
+        store.add_message(1, "assistant", "Локальный ответ")
+        store.add_message(1, "user", "Первое", telegram_message_id=7)
+        store.add_message(1, "user", "Второе", telegram_message_id=11)
+
+        self.assertTrue(store.has_chat_history(1))
+        self.assertEqual(store.latest_telegram_message_id(1), 11)
+
+        store.close()
+
+    def test_sender_and_explicit_timestamps_are_normalized_and_preserved(self) -> None:
+        store = MilanaMemoryStore()
+        store.add_message(
+            1,
+            "user",
+            "  Привет  ",
+            sender_name="  Анна  ",
+            created_at="2026-07-11T10:00:00+00:00",
+        )
+
+        message = store.get_chat_history(1)[0]
+        self.assertEqual(message.content, "Привет")
+        self.assertEqual(message.sender_name, "Анна")
+        self.assertEqual(message.created_at, "2026-07-11T10:00:00+00:00")
+
         store.close()
 
     def test_response_input_uses_only_requested_chat(self) -> None:

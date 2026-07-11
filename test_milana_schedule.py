@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from milana_schedule import (
+    Activity,
     ResponsePolicy,
     SCHEDULE_PATH,
     WeeklyRoutine,
@@ -10,7 +11,13 @@ from milana_schedule import (
     calculate_day_metrics,
     format_current_status,
     format_day_schedule,
+    format_duration,
+    format_response_delay,
+    format_response_policy,
     load_routine,
+    minutes_to_time,
+    parse_utc_offset,
+    time_to_minutes,
 )
 
 
@@ -241,6 +248,68 @@ class MilanaScheduleTests(unittest.TestCase):
             self.routine.response_policy_at(sleeping_at).label,
             "не читает и не отвечает",
         )
+
+    def test_time_parsing_and_cross_midnight_activity_boundaries(self) -> None:
+        self.assertEqual(time_to_minutes("00:00"), 0)
+        self.assertEqual(time_to_minutes("23:59"), 1439)
+        self.assertEqual(minutes_to_time(1441), "00:01")
+        self.assertEqual(parse_utc_offset("+05:30").utcoffset(None), timedelta(hours=5, minutes=30))
+
+        sleep = Activity("Сон", "sleep", 23 * 60, 7 * 60, 8 * 60)
+        self.assertTrue(sleep.contains(23 * 60))
+        self.assertTrue(sleep.contains(6 * 60 + 59))
+        self.assertFalse(sleep.contains(12 * 60))
+
+    def test_invalid_time_and_timezone_values_are_rejected(self) -> None:
+        invalid_times = (None, "24:00", "12:60", "12-00")
+        for value in invalid_times:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    time_to_minutes(value)
+
+        for value in (None, "UTC+5", "+15:00", "+05:60"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_utc_offset(value)
+
+    def test_human_readable_duration_and_response_policy_formats(self) -> None:
+        self.assertEqual(format_duration(-5), "0 мин")
+        self.assertEqual(format_duration(125), "2 ч 5 мин")
+        self.assertEqual(format_response_delay(3661), "1 ч 1 мин 1 сек")
+        self.assertEqual(
+            format_response_policy(ResponsePolicy(True, 0, 0)),
+            "читает и отвечает сразу",
+        )
+        self.assertEqual(
+            format_response_policy(ResponsePolicy(True, 30, 30)),
+            "читает и отвечает примерно через 30 сек",
+        )
+
+    def test_randint_must_return_an_integer_inside_policy_range(self) -> None:
+        received_at = datetime(2026, 7, 13, 21, 0, tzinfo=YEKT)
+        invalid_results = (True, 0, 601, 1.5)
+
+        for result in invalid_results:
+            with self.subTest(result=result):
+                with self.assertRaisesRegex(ValueError, "randint"):
+                    self.routine.plan_response(
+                        received_at,
+                        randint=lambda low, high, result=result: result,
+                    )
+
+    def test_load_routine_reports_missing_and_invalid_json(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.json"
+            with self.assertRaisesRegex(ValueError, "не найден"):
+                load_routine(missing)
+
+            invalid = Path(directory) / "invalid.json"
+            invalid.write_text("{", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Ошибка JSON"):
+                load_routine(invalid)
 
 
 if __name__ == "__main__":
