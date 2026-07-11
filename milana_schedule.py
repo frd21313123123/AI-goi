@@ -74,6 +74,7 @@ DEFAULT_ONLINE_BEHAVIOR: Mapping[str, int] = {
     "spontaneous_online_duration_min_seconds": 2 * 60,
     "spontaneous_online_duration_max_seconds": 5 * 60,
     "sleep_buffer_seconds": 60,
+    "conversation_sleep_delay_seconds": 30 * 60,
 }
 
 
@@ -174,6 +175,7 @@ class OnlineBehavior:
     spontaneous_online_duration_min_seconds: int
     spontaneous_online_duration_max_seconds: int
     sleep_buffer_seconds: int
+    conversation_sleep_delay_seconds: int
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:

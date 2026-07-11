@@ -429,6 +429,60 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         clock.value += timedelta(seconds=60)
         self.assertFalse(presence.is_online())
 
+    async def test_answer_defers_sleep_for_thirty_minutes(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 23, 25, tzinfo=YEKT))
+        client = MagicMock()
+        client.side_effect = AsyncMock(return_value=None)
+        presence = MilanaPresenceController(
+            client,
+            load_routine(),
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=lambda minimum, maximum: minimum,
+        )
+
+        await presence.begin_response()
+        await presence.finish_response(answered=True)
+
+        expected = clock.value + timedelta(minutes=30)
+        self.assertEqual(presence.sleep_deferred_until, expected)
+        self.assertTrue(presence.is_sleep_deferred(expected - timedelta(seconds=1)))
+        self.assertFalse(presence.is_sleep_deferred(expected))
+
+    async def test_message_during_deferred_sleep_extends_timer_from_new_reply(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 23, 25, tzinfo=YEKT))
+        responder, _, _ = make_responder(clock)
+
+        with patch("builtins.print"):
+            await responder.process(make_event(clock.value, message_id=300))
+            first_deadline = responder.presence.sleep_deferred_until
+            self.assertIsNotNone(first_deadline)
+
+            clock.value = datetime(2026, 7, 13, 23, 35, tzinfo=YEKT)
+            await responder.process(make_event(clock.value, message_id=301))
+
+        self.assertEqual(clock.delays[-1], 1)
+        self.assertEqual(
+            responder.presence.sleep_deferred_until,
+            clock.value + timedelta(minutes=30),
+        )
+        self.assertGreater(responder.presence.sleep_deferred_until, first_deadline)
+
+    async def test_message_received_just_before_timer_expiry_still_gets_reply(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 23, 25, tzinfo=YEKT))
+        responder, _, _ = make_responder(clock)
+
+        with patch("builtins.print"):
+            await responder.process(make_event(clock.value, message_id=300))
+            deadline = responder.presence.sleep_deferred_until
+            self.assertIsNotNone(deadline)
+            clock.value = deadline - timedelta(milliseconds=500)
+            event = make_event(clock.value, message_id=301)
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Готовый ответ")
+        self.assertGreater(responder.presence.sleep_deferred_until, deadline)
+
     async def test_presence_spontaneously_goes_online_for_a_few_minutes(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         client = MagicMock()

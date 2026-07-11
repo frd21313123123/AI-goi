@@ -404,6 +404,8 @@ class MilanaPresenceController:
         self._sleep = sleep
         self._randint = randint
         self._online_until: datetime | None = None
+        self._last_outgoing_at: datetime | None = None
+        self._sleep_deferred_until: datetime | None = None
         self._next_spontaneous_online_at: datetime | None = None
         self._active_responses = 0
         self._last_offline: bool | None = None
@@ -417,14 +419,38 @@ class MilanaPresenceController:
     def online_until(self) -> datetime | None:
         return self._online_until
 
+    @property
+    def sleep_deferred_until(self) -> datetime | None:
+        """Момент, после которого Милана может уснуть после переписки."""
+        return self._sleep_deferred_until
+
+    def is_sleep_deferred(self, value: datetime | None = None) -> bool:
+        moment = self.routine.normalize_datetime(value) if value else self.current_time()
+        return (
+            self._last_outgoing_at is not None
+            and self._sleep_deferred_until is not None
+            and self._last_outgoing_at <= moment
+            and moment < self._sleep_deferred_until
+        )
+
+    def can_respond(self, value: datetime | None = None) -> bool:
+        """Разрешает продолжить активную переписку после планового отбоя."""
+        moment = self.routine.normalize_datetime(value) if value else self.current_time()
+        return (
+            self.routine.response_policy_at(moment).available
+            or self.is_sleep_deferred(moment)
+        )
+
     def is_online(self, value: datetime | None = None) -> bool:
         moment = self.routine.normalize_datetime(value) if value else self.current_time()
-        if not self.routine.response_policy_at(moment).available:
+        if self._active_responses > 0:
+            return True
+        if not self.can_respond(moment):
             return False
         grace_is_active = (
             self._online_until is not None and moment < self._online_until
         )
-        return self._active_responses > 0 or grace_is_active
+        return grace_is_active
 
     async def _publish_locked(self) -> None:
         offline = not self.is_online()
@@ -453,6 +479,16 @@ class MilanaPresenceController:
             online_seconds: int | None = None
             if answered:
                 behavior = self.routine.online_behavior
+                answered_at = self.current_time()
+                self._last_outgoing_at = answered_at
+                sleep_candidate = answered_at + timedelta(
+                    seconds=behavior.conversation_sleep_delay_seconds
+                )
+                if (
+                    self._sleep_deferred_until is None
+                    or sleep_candidate > self._sleep_deferred_until
+                ):
+                    self._sleep_deferred_until = sleep_candidate
                 online_seconds = self._randint(
                     behavior.post_reply_online_min_seconds,
                     behavior.post_reply_online_max_seconds,
@@ -529,6 +565,8 @@ class MilanaPresenceController:
         async with self._lock:
             self._active_responses = 0
             self._online_until = None
+            self._last_outgoing_at = None
+            self._sleep_deferred_until = None
             self._next_spontaneous_online_at = None
             try:
                 await self.client(functions.account.UpdateStatusRequest(offline=True))
@@ -939,8 +977,9 @@ class MilanaMessageResponder:
         received_at: datetime,
         *,
         received_while_online: bool,
+        continues_conversation: bool,
     ) -> None:
-        if received_while_online:
+        if received_while_online or continues_conversation:
             behavior = self.routine.online_behavior
             fast_delay = self._randint(
                 behavior.online_response_min_seconds,
@@ -953,10 +992,10 @@ class MilanaMessageResponder:
                 f"(через {fast_delay} сек.)"
             )
             now = self.current_time()
-            if self.routine.response_policy_at(now).available:
+            if continues_conversation or self.presence.can_respond(now):
                 await self._sleep_until(fast_target)
                 now = self.current_time()
-                if self.routine.response_policy_at(now).available:
+                if continues_conversation or self.presence.can_respond(now):
                     return
                 # Если после короткой задержки окно закрылось (редко),
                 # планируем чтение заново от текущего момента.
@@ -972,17 +1011,17 @@ class MilanaMessageResponder:
             )
             await self._sleep_until(plan.respond_at)
             now = self.current_time()
-            if self.routine.response_policy_at(now).available:
+            if self.presence.can_respond(now):
                 return None
 
             # Системные часы или расписание могли измениться во время ожидания.
             # Во сне по-прежнему ничего не читаем и строим новый план от «сейчас».
             plan = self.routine.plan_response(now, randint=self._randint)
 
-    async def _wait_out_sleep(self) -> None:
+    async def _wait_out_sleep(self, *, continues_conversation: bool = False) -> None:
         while True:
             now = self.current_time()
-            if self.routine.response_policy_at(now).available:
+            if continues_conversation or self.presence.can_respond(now):
                 return
             plan = self.routine.plan_response(now, randint=self._randint)
             print(
@@ -991,10 +1030,16 @@ class MilanaMessageResponder:
             )
             await self._sleep_until(plan.respond_at)
 
-    async def _wait_for_full_online_window(self) -> None:
+    async def _wait_for_full_online_window(
+        self, *, continues_conversation: bool = False
+    ) -> None:
         """Не начинает ответ, если до сна осталось меньше минуты."""
         while True:
-            await self._wait_out_sleep()
+            await self._wait_out_sleep(
+                continues_conversation=continues_conversation
+            )
+            if continues_conversation:
+                return
             now = self.current_time()
             state = self.routine.state_at(now)
             seconds_to_next = (
@@ -1023,6 +1068,7 @@ class MilanaMessageResponder:
         """Последовательно обрабатывает сообщения одного чата, не блокируя другие."""
         received_at = self.received_time(event)
         received_while_online = self.presence.is_online(received_at)
+        continues_conversation = self.presence.is_sleep_deferred(received_at)
         chat_key: int | str = event.chat_id
         if chat_key is None:
             chat_key = str(event.sender_id or "unknown")
@@ -1033,6 +1079,7 @@ class MilanaMessageResponder:
                 event,
                 received_at=received_at,
                 received_while_online=received_while_online,
+                continues_conversation=continues_conversation,
             )
 
     async def _process_locked(
@@ -1041,6 +1088,7 @@ class MilanaMessageResponder:
         *,
         received_at: datetime,
         received_while_online: bool,
+        continues_conversation: bool,
     ) -> None:
         print(
             f"Получено входящее сообщение: chat_id={event.chat_id}, "
@@ -1053,6 +1101,7 @@ class MilanaMessageResponder:
             await self._wait_before_reading(
                 received_at,
                 received_while_online=received_while_online,
+                continues_conversation=continues_conversation,
             )
 
             action_target: Any = event.chat_id
@@ -1125,7 +1174,9 @@ class MilanaMessageResponder:
                 chat_key, recent_limit=RECENT_MESSAGES_LIMIT
             )
 
-            await self._wait_for_full_online_window()
+            await self._wait_for_full_online_window(
+                continues_conversation=continues_conversation
+            )
             answer = await self._generate_answer(
                 chat_key=chat_key,
                 message_id=event.id,
@@ -1151,6 +1202,7 @@ class MilanaMessageResponder:
                     candidate_id = getattr(sent, "id", None)
                     if sent_message_id is None and isinstance(candidate_id, int):
                         sent_message_id = candidate_id
+            answered = True
             self.memory.add_message(
                 chat_key,
                 "assistant",
@@ -1158,7 +1210,6 @@ class MilanaMessageResponder:
                 telegram_message_id=sent_message_id,
                 sender_name="Милана",
             )
-            answered = True
             print(f"Отправлен ИИ-ответ на message_id={event.id}")
         except (OpenAIError, RPCError, OSError, TypeError, ValueError) as exc:
             print(

@@ -264,6 +264,7 @@ class MilanaScheduleTests(unittest.TestCase):
                 spontaneous_online_duration_min_seconds=120,
                 spontaneous_online_duration_max_seconds=300,
                 sleep_buffer_seconds=60,
+                conversation_sleep_delay_seconds=1800,
             ),
         )
 
