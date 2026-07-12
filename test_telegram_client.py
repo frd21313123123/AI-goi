@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from openai import BadRequestError
+from telethon import functions, types
 
 from milana_schedule import load_routine
 from telegram_client import (
@@ -73,9 +74,12 @@ class GatedClock(AdvancingClock):
         self.value += timedelta(seconds=seconds)
 
 
-def structured_response(*messages: str, output=None):
+def structured_response(*messages: str, reaction: str | None = None, output=None):
     return SimpleNamespace(
-        output_text=json.dumps({"messages": list(messages)}, ensure_ascii=False),
+        output_text=json.dumps(
+            {"messages": list(messages), "reaction": reaction},
+            ensure_ascii=False,
+        ),
         output=[] if output is None else output,
     )
 
@@ -938,6 +942,13 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             request["text"]["format"]["schema"]["properties"]["messages"]["maxItems"],
             responder.config.message_flow.max_reply_messages,
         )
+        schema = request["text"]["format"]["schema"]
+        self.assertEqual(schema["properties"]["messages"]["minItems"], 0)
+        self.assertEqual(schema["required"], ["messages", "reaction"])
+        self.assertEqual(
+            schema["properties"]["reaction"]["anyOf"][0]["enum"],
+            ["👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔"],
+        )
         assistant_messages = [
             item
             for item in responder.memory.get_chat_history(100)
@@ -1742,6 +1753,172 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         event.reply.assert_awaited_once_with("Не могу помочь")
 
+    async def test_reaction_only_targets_message_and_counts_as_answer(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock)
+        responder.presence.begin_response = AsyncMock()
+        responder.presence.finish_response = AsyncMock(return_value=None)
+        openai_client.responses.create.return_value = structured_response(
+            reaction="👍"
+        )
+        event = make_event(clock.value, message_id=777)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        responder.presence.finish_response.assert_awaited_once_with(answered=True)
+        event.reply.assert_not_awaited()
+        client.assert_called_once()
+        request = client.call_args.args[0]
+        self.assertIsInstance(request, functions.messages.SendReactionRequest)
+        self.assertEqual(request.peer, "peer")
+        self.assertEqual(request.msg_id, 777)
+        self.assertEqual(len(request.reaction), 1)
+        self.assertIsInstance(request.reaction[0], types.ReactionEmoji)
+        self.assertEqual(request.reaction[0].emoticon, "👍")
+        self.assertEqual(
+            [item.role for item in responder.memory.get_chat_history(100)],
+            ["user"],
+        )
+
+    async def test_reaction_is_sent_before_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        openai_client.responses.create.return_value = structured_response(
+            "Текст после реакции",
+            reaction="❤",
+        )
+        event = make_event(clock.value)
+        actions: list[str] = []
+
+        async def react(request):
+            actions.append(f"reaction:{request.reaction[0].emoticon}")
+
+        async def reply(text):
+            actions.append(f"text:{text}")
+            return SimpleNamespace(id=401)
+
+        client.side_effect = react
+        event.reply.side_effect = reply
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        self.assertEqual(actions, ["reaction:❤", "text:Текст после реакции"])
+        assistant = [
+            item.content
+            for item in responder.memory.get_chat_history(100)
+            if item.role == "assistant"
+        ]
+        self.assertEqual(assistant, ["Текст после реакции"])
+
+    async def test_reaction_failure_does_not_block_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        openai_client.responses.create.return_value = structured_response(
+            "Всё равно отвечу",
+            reaction="🔥",
+        )
+        client.side_effect = OSError("Реакции отключены")
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=401)
+
+        with patch("builtins.print") as output:
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Всё равно отвечу")
+        self.assertTrue(
+            any("Ошибка реакции" in str(call) for call in output.call_args_list)
+        )
+
+    async def test_failed_reaction_only_does_not_send_emoji_as_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        openai_client.responses.create.return_value = structured_response(
+            reaction="🤔"
+        )
+        client.side_effect = OSError("Реакции отключены")
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_not_awaited()
+        client.send_message.assert_not_awaited()
+        self.assertEqual(
+            [item.role for item in responder.memory.get_chat_history(100)],
+            ["user"],
+        )
+
+    async def test_reaction_commits_staged_diary_without_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock, dev_chat=True)
+        diary_call = SimpleNamespace(
+            type="function_call",
+            name="write_diary",
+            arguments='{"content":"Пользователь сдал экзамен"}',
+            call_id="reaction-diary",
+        )
+        openai_client.responses.create.side_effect = [
+            SimpleNamespace(output_text="", output=[diary_call]),
+            structured_response(reaction="🎉"),
+        ]
+
+        with patch("builtins.print"):
+            await responder.process(make_event(clock.value))
+
+        self.assertEqual(
+            [entry.content for entry in responder.memory.get_diary()],
+            ["Пользователь сдал экзамен"],
+        )
+
+    async def test_new_message_after_reaction_cancels_stale_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        first = make_event(clock.value, text="Первая новость", message_id=300)
+        second = make_event(clock.value, text="Уточнение", message_id=301)
+        second.reply.return_value = SimpleNamespace(id=501)
+        openai_client.responses.create.side_effect = [
+            structured_response("Устаревший текст", reaction="👍"),
+            structured_response("Актуальный ответ"),
+        ]
+        submitted_second = False
+
+        async def react_then_receive(request):
+            nonlocal submitted_second
+            if isinstance(request, functions.messages.SendReactionRequest):
+                self.assertEqual(request.msg_id, 300)
+                if not submitted_second:
+                    submitted_second = True
+                    await responder.submit(second)
+
+        client.side_effect = react_then_receive
+
+        with patch("builtins.print"):
+            await responder.process(first)
+
+        first.reply.assert_not_awaited()
+        second.reply.assert_awaited_once_with("Актуальный ответ")
+        self.assertEqual(openai_client.responses.create.await_count, 2)
+
+    async def test_unknown_reaction_is_not_sent(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        openai_client.responses.create.return_value = SimpleNamespace(
+            output_text=json.dumps(
+                {"messages": ["Текст"], "reaction": "💩"},
+                ensure_ascii=False,
+            ),
+            output=[],
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        client.assert_not_called()
+        event.reply.assert_not_awaited()
+
     async def test_blank_structured_items_are_removed_before_sending(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         flow = MessageFlowConfig(
@@ -1756,7 +1933,10 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         responder._wait_for_full_online_window = AsyncMock()
         openai_client.responses.create.return_value = SimpleNamespace(
             output_text=json.dumps(
-                {"messages": ["  Первая часть  ", "", "   ", "Вторая часть"]},
+                {
+                    "messages": ["  Первая часть  ", "", "   ", "Вторая часть"],
+                    "reaction": None,
+                },
                 ensure_ascii=False,
             ),
             output=[],

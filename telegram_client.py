@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from openai import AsyncOpenAI, BadRequestError, OpenAIError
-from telethon import TelegramClient, events, functions, utils
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 
 from milana_memory import (
@@ -56,6 +56,7 @@ SUPPORTED_IMAGE_MIME_TYPES = {
     "image/png",
     "image/webp",
 }
+SAFE_REACTIONS = ("👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔")
 
 
 @dataclass(frozen=True)
@@ -711,6 +712,7 @@ class PreparedIncoming:
 @dataclass(frozen=True)
 class GeneratedReply:
     messages: tuple[str, ...]
+    reaction: str | None = None
     staged_diary_entries: tuple[str, ...] = ()
 
 
@@ -728,6 +730,11 @@ class ChatWorkerState:
 class SendOutcome:
     sent_count: int
     interrupted: bool
+    reaction_sent: bool = False
+
+    @property
+    def answered(self) -> bool:
+        return self.reaction_sent or self.sent_count > 0
 
 
 class MilanaMessageResponder:
@@ -865,11 +872,17 @@ class MilanaMessageResponder:
                             "messages": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "minItems": 1,
+                                "minItems": 0,
                                 "maxItems": self.message_flow.max_reply_messages,
-                            }
+                            },
+                            "reaction": {
+                                "anyOf": [
+                                    {"type": "string", "enum": list(SAFE_REACTIONS)},
+                                    {"type": "null"},
+                                ]
+                            },
                         },
-                        "required": ["messages"],
+                        "required": ["messages", "reaction"],
                         "additionalProperties": False,
                     },
                 }
@@ -1187,13 +1200,19 @@ class MilanaMessageResponder:
 
         refusal = self._response_refusal(response)
         if refusal:
-            return GeneratedReply((refusal,), tuple(staged_diary_entries))
+            return GeneratedReply(
+                messages=(refusal,),
+                staged_diary_entries=tuple(staged_diary_entries),
+            )
 
         output_text = str(getattr(response, "output_text", "") or "").strip()
         if not structured:
             if not output_text:
                 raise ValueError("Модель вернула пустой ответ")
-            return GeneratedReply((output_text,), tuple(staged_diary_entries))
+            return GeneratedReply(
+                messages=(output_text,),
+                staged_diary_entries=tuple(staged_diary_entries),
+            )
 
         try:
             payload = json.loads(output_text)
@@ -1201,6 +1220,11 @@ class MilanaMessageResponder:
             raise ValueError("Модель вернула некорректный структурированный ответ") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise ValueError("Структурированный ответ не содержит массив messages")
+        if "reaction" not in payload:
+            raise ValueError("Структурированный ответ не содержит поле reaction")
+        reaction = payload.get("reaction")
+        if reaction is not None and reaction not in SAFE_REACTIONS:
+            raise ValueError("Структурированный ответ содержит недопустимую реакцию")
 
         raw_messages = payload["messages"]
         if any(not isinstance(message, str) for message in raw_messages):
@@ -1208,9 +1232,13 @@ class MilanaMessageResponder:
         messages = tuple(message.strip() for message in raw_messages if message.strip())
         if len(messages) > self.message_flow.max_reply_messages:
             raise ValueError("Модель превысила максимальное число сообщений в ответе")
-        if not messages:
+        if not messages and reaction is None:
             raise ValueError("Модель вернула пустой ответ")
-        return GeneratedReply(messages, tuple(staged_diary_entries))
+        return GeneratedReply(
+            messages=messages,
+            reaction=reaction,
+            staged_diary_entries=tuple(staged_diary_entries),
+        )
 
     async def _generate_answer(
         self,
@@ -1233,8 +1261,13 @@ class MilanaMessageResponder:
             "Сформируй готовый ответ для Telegram как от Миланы. Самостоятельно реши, "
             f"нужна одна реплика или естественная серия до {max_parts} реплик. "
             "Не дроби цельную мысль искусственно, но можешь отделить короткое приветствие, "
-            "реакцию или продолжение так, как люди пишут в живом чате. Каждая строка массива "
-            "messages будет отправлена отдельным сообщением; не добавляй служебные пояснения."
+            "эмоциональный отклик или продолжение так, как люди пишут в живом чате. "
+            "Поле reaction — необязательная по смыслу Telegram-реакция на последнее сообщение "
+            "пользователя из разрешённого набора. Используй реакцию без текста только для "
+            "простого подтверждения или эмоционального отклика, когда содержательный ответ не "
+            "нужен; если требуется пояснение, вопрос или помощь, добавь текст. Не ставь реакцию "
+            "механически к каждому ответу. Каждая строка массива messages будет отправлена "
+            "отдельным сообщением; не добавляй служебные пояснения."
         )
         input_items: list[Any] = [*history_input]
         for message in messages:
@@ -1752,7 +1785,7 @@ class MilanaMessageResponder:
         parts: list[str] = []
         for message in reply.messages:
             parts.extend(split_telegram_text(message))
-        if not parts:
+        if not parts and reply.reaction is None:
             raise ValueError("Модель вернула пустой ответ")
         return parts
 
@@ -1768,7 +1801,51 @@ class MilanaMessageResponder:
         parts = self._physical_reply_parts(reply)
         reply_event = active[-1].event
         sent_count = 0
+        reaction_sent = False
         diary_committed = False
+
+        def commit_diary_once() -> None:
+            nonlocal diary_committed
+            if diary_committed:
+                return
+            try:
+                self._commit_staged_diary(
+                    reply.staged_diary_entries,
+                    chat_key=state.chat_key,
+                    source_message_id=getattr(reply_event, "id", None),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"Ответ отправлен, но записи дневника не сохранены: {exc}",
+                    file=sys.stderr,
+                )
+            diary_committed = True
+
+        if reply.reaction is not None:
+            if await self._revision(state) != revision:
+                return SendOutcome(sent_count=0, interrupted=True)
+            if not self._full_online_window_is_open(
+                continues_conversation=continues_conversation
+            ):
+                return SendOutcome(sent_count=0, interrupted=True)
+            try:
+                peer = await self._action_target(reply_event)
+                await self.client(
+                    functions.messages.SendReactionRequest(
+                        peer=peer,
+                        msg_id=reply_event.id,
+                        reaction=[types.ReactionEmoji(emoticon=reply.reaction)],
+                    )
+                )
+            except (RPCError, OSError, TypeError, ValueError) as exc:
+                print(
+                    f"Ошибка реакции на message_id={reply_event.id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                reaction_sent = True
+                commit_diary_once()
 
         for index, part in enumerate(parts):
             if index > 0:
@@ -1777,14 +1854,26 @@ class MilanaMessageResponder:
                 maximum_ms = round(flow.inter_message_max_delay_seconds * 1000)
                 delay = self._randint(minimum_ms, maximum_ms) / 1000
                 if await self._sleep_or_changed(state, delay):
-                    return SendOutcome(sent_count=sent_count, interrupted=True)
+                    return SendOutcome(
+                        sent_count=sent_count,
+                        interrupted=True,
+                        reaction_sent=reaction_sent,
+                    )
 
             if await self._revision(state) != revision:
-                return SendOutcome(sent_count=sent_count, interrupted=True)
+                return SendOutcome(
+                    sent_count=sent_count,
+                    interrupted=True,
+                    reaction_sent=reaction_sent,
+                )
             if index == 0 and not self._full_online_window_is_open(
                 continues_conversation=continues_conversation
             ):
-                return SendOutcome(sent_count=sent_count, interrupted=True)
+                return SendOutcome(
+                    sent_count=sent_count,
+                    interrupted=True,
+                    reaction_sent=reaction_sent,
+                )
 
             try:
                 if index == 0:
@@ -1797,7 +1886,11 @@ class MilanaMessageResponder:
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
-                return SendOutcome(sent_count=sent_count, interrupted=False)
+                return SendOutcome(
+                    sent_count=sent_count,
+                    interrupted=False,
+                    reaction_sent=reaction_sent,
+                )
 
             sent_count += 1
             candidate_id = getattr(sent, "id", None)
@@ -1816,21 +1909,13 @@ class MilanaMessageResponder:
                     f"Ответ отправлен, но не сохранён в памяти: {exc}",
                     file=sys.stderr,
                 )
-            if not diary_committed:
-                try:
-                    self._commit_staged_diary(
-                        reply.staged_diary_entries,
-                        chat_key=state.chat_key,
-                        source_message_id=getattr(reply_event, "id", None),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(
-                        f"Ответ отправлен, но записи дневника не сохранены: {exc}",
-                        file=sys.stderr,
-                    )
-                diary_committed = True
+            commit_diary_once()
 
-        return SendOutcome(sent_count=sent_count, interrupted=False)
+        return SendOutcome(
+            sent_count=sent_count,
+            interrupted=False,
+            reaction_sent=reaction_sent,
+        )
 
     async def _update_summary_while_idle(self, state: ChatWorkerState) -> None:
         async with self._chat_states_lock:
@@ -1957,7 +2042,7 @@ class MilanaMessageResponder:
                     )
                 finally:
                     if presence_started:
-                        answered = outcome is not None and outcome.sent_count > 0
+                        answered = outcome is not None and outcome.answered
                         online_seconds = await self.presence.finish_response(answered=answered)
                         if online_seconds is not None:
                             print(
@@ -1965,13 +2050,19 @@ class MilanaMessageResponder:
                                 f"{online_seconds} сек."
                             )
 
-                if outcome is not None and outcome.interrupted and outcome.sent_count == 0:
+                if outcome is not None and outcome.interrupted and not outcome.answered:
                     # No part crossed the commit boundary: keep the old inputs and
                     # merge the newly queued messages into the same response.
                     continue
 
                 sent_count = outcome.sent_count if outcome is not None else 0
-                interrupted = bool(outcome and outcome.interrupted and sent_count > 0)
+                reaction_sent = bool(outcome and outcome.reaction_sent)
+                answered = bool(outcome and outcome.answered)
+                interrupted = bool(outcome and outcome.interrupted and answered)
+                if reaction_sent:
+                    print(
+                        f"Поставлена реакция на message_id={reply_event.id}"
+                    )
                 if sent_count:
                     print(
                         f"Отправлено частей ИИ-ответа: {sent_count}; "
@@ -1980,7 +2071,7 @@ class MilanaMessageResponder:
                 active = []
                 context = None
                 skip_schedule_once = interrupted
-                if sent_count:
+                if answered:
                     await self._update_summary_while_idle(state)
         finally:
             async with self._chat_states_lock:
