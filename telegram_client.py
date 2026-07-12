@@ -65,6 +65,23 @@ SUPPORTED_IMAGE_MIME_TYPES = {
     "image/png",
     "image/webp",
 }
+SUPPORTED_GEMINI_VIDEO_MIME_TYPES = {
+    "video/3gpp",
+    "video/avi",
+    "video/mov",
+    "video/mp4",
+    "video/mpeg",
+    "video/mpg",
+    "video/webm",
+    "video/wmv",
+    "video/x-flv",
+}
+GEMINI_VIDEO_MIME_ALIASES = {
+    "video/quicktime": "video/mov",
+    "video/x-msvideo": "video/avi",
+    "video/x-ms-wmv": "video/wmv",
+}
+MAX_GEMINI_INLINE_VIDEO_BYTES = 20 * 1024 * 1024
 ANIMATED_STICKER_MIME_TYPE = "application/x-tgsticker"
 VIDEO_STICKER_MIME_TYPE = "video/webm"
 SAFE_REACTIONS = ("👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔")
@@ -446,6 +463,25 @@ def telegram_image_mime_type(event: Any) -> str | None:
     return None
 
 
+def telegram_video_mime_type(event: Any) -> str | None:
+    """Возвращает поддерживаемый Gemini MIME обычного Telegram-видео."""
+    message = getattr(event, "message", None)
+    sticker = getattr(event, "sticker", None)
+    if sticker is None and message is not None and message is not event:
+        sticker = getattr(message, "sticker", None)
+    if sticker is not None:
+        return None
+
+    file_info = getattr(event, "file", None)
+    if file_info is None and message is not None and message is not event:
+        file_info = getattr(message, "file", None)
+    mime_type = getattr(file_info, "mime_type", None)
+    if not isinstance(mime_type, str):
+        return None
+    normalized = GEMINI_VIDEO_MIME_ALIASES.get(mime_type.lower(), mime_type.lower())
+    return normalized if normalized in SUPPORTED_GEMINI_VIDEO_MIME_TYPES else None
+
+
 def telegram_sticker_info(event: Any) -> TelegramStickerInfo | None:
     """Возвращает описание стикера и доступное растровое превью."""
     message = getattr(event, "message", None)
@@ -555,6 +591,43 @@ async def telegram_image_data_url(
         raise ValueError("Telegram вернул превью в неподдерживаемом формате")
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{resolved_mime_type};base64,{encoded}"
+
+
+async def telegram_video_data_url(event: Any, mime_type: str) -> str:
+    """Скачивает небольшое Telegram-видео и кодирует его для Gemini-адаптера."""
+    if mime_type not in SUPPORTED_GEMINI_VIDEO_MIME_TYPES:
+        raise ValueError(f"Неподдерживаемый Gemini формат видео: {mime_type}")
+
+    message = getattr(event, "message", None)
+    file_info = getattr(event, "file", None)
+    if file_info is None and message is not None and message is not event:
+        file_info = getattr(message, "file", None)
+    declared_size = getattr(file_info, "size", None)
+    if (
+        isinstance(declared_size, int)
+        and declared_size >= MAX_GEMINI_INLINE_VIDEO_BYTES
+    ):
+        raise ValueError(
+            "Видео слишком большое для прямой передачи Gemini "
+            f"({declared_size} байт; лимит меньше {MAX_GEMINI_INLINE_VIDEO_BYTES})"
+        )
+
+    download_media = getattr(message, "download_media", None)
+    if not callable(download_media):
+        download_media = getattr(event, "download_media", None)
+    if not callable(download_media):
+        raise ValueError("Telegram не предоставил способ скачать видео")
+
+    video_bytes = await download_media(file=bytes)
+    if not isinstance(video_bytes, bytes) or not video_bytes:
+        raise ValueError("Не удалось скачать видео из Telegram")
+    if len(video_bytes) >= MAX_GEMINI_INLINE_VIDEO_BYTES:
+        raise ValueError(
+            "Видео слишком большое для прямой передачи Gemini "
+            f"({len(video_bytes)} байт; лимит меньше {MAX_GEMINI_INLINE_VIDEO_BYTES})"
+        )
+    encoded = base64.b64encode(video_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def _pillow_image_png_bytes(image: Any) -> bytes:
@@ -945,6 +1018,7 @@ class PreparedIncoming:
     sender_name: str
     text: str
     image_data_url: str | None
+    video_data_url: str | None
 
 
 @dataclass(frozen=True)
@@ -1071,6 +1145,11 @@ class MilanaMessageResponder:
                         text = sticker_info.description
                     elif telegram_image_mime_type(message) is not None:
                         text = "[фото без подписи]"
+                    elif (
+                        self.config.provider == GEMINI_LLM_CHOICE
+                        and telegram_video_mime_type(message) is not None
+                    ):
+                        text = "[видео без подписи]"
                     else:
                         continue
                 outgoing = bool(getattr(message, "out", False))
@@ -1606,7 +1685,20 @@ class MilanaMessageResponder:
         input_items: list[Any] = [*history_input]
         for message in messages:
             current_text = f"{message.sender_name}: {message.text}"
-            if message.image_data_url is None:
+            if message.video_data_url is not None:
+                input_items.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_video",
+                                "video_url": message.video_data_url,
+                            },
+                            {"type": "input_text", "text": current_text},
+                        ],
+                    }
+                )
+            elif message.image_data_url is None:
                 input_items.append({"role": "user", "content": current_text})
             else:
                 input_items.append(
@@ -2002,13 +2094,24 @@ class MilanaMessageResponder:
             text = (getattr(event, "raw_text", "") or "").strip()
             sticker_info = telegram_sticker_info(event)
             image_mime_type = telegram_image_mime_type(event)
-            if not text and image_mime_type is None and sticker_info is None:
+            video_mime_type = (
+                telegram_video_mime_type(event)
+                if self.config.provider == GEMINI_LLM_CHOICE
+                else None
+            )
+            if (
+                not text
+                and image_mime_type is None
+                and video_mime_type is None
+                and sticker_info is None
+            ):
                 print(
                     f"Прочитано и пропущено сообщение без текста, message_id={event.id}"
                 )
                 continue
 
             image_data_url: str | None = None
+            video_data_url: str | None = None
             if image_mime_type is not None:
                 try:
                     image_data_url = await telegram_image_data_url(
@@ -2021,8 +2124,49 @@ class MilanaMessageResponder:
                     )
                     if not text and sticker_info is None:
                         continue
+            elif video_mime_type is not None:
+                try:
+                    video_data_url = await telegram_video_data_url(
+                        event, video_mime_type
+                    )
+                except (
+                    RPCError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    AttributeError,
+                    IndexError,
+                ) as exc:
+                    print(
+                        f"Не удалось загрузить видео message_id={event.id}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if not text:
+                        continue
             elif sticker_info is not None:
-                if sticker_info.thumbnail is not None:
+                if (
+                    self.config.provider == GEMINI_LLM_CHOICE
+                    and sticker_info.mime_type == VIDEO_STICKER_MIME_TYPE
+                ):
+                    try:
+                        video_data_url = await telegram_video_data_url(
+                            event,
+                            VIDEO_STICKER_MIME_TYPE,
+                        )
+                    except (
+                        RPCError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                        AttributeError,
+                        IndexError,
+                    ) as exc:
+                        print(
+                            "Не удалось загрузить исходный видеостикер "
+                            f"message_id={event.id}: {exc}",
+                            file=sys.stderr,
+                        )
+                if video_data_url is None and sticker_info.thumbnail is not None:
                     try:
                         image_data_url = await telegram_image_data_url(
                             event,
@@ -2044,6 +2188,7 @@ class MilanaMessageResponder:
                         )
                 if (
                     image_data_url is None
+                    and video_data_url is None
                     and sticker_info.mime_type
                     in {ANIMATED_STICKER_MIME_TYPE, VIDEO_STICKER_MIME_TYPE}
                 ):
@@ -2072,6 +2217,8 @@ class MilanaMessageResponder:
                     if text
                     else sticker_info.description
                 )
+            elif video_mime_type is not None:
+                stored_text = text or "[видео без подписи]"
             else:
                 stored_text = text or "[фото без подписи]"
             try:
@@ -2108,6 +2255,7 @@ class MilanaMessageResponder:
                     sender_name=sender_name,
                     text=stored_text,
                     image_data_url=image_data_url,
+                    video_data_url=video_data_url,
                 )
             )
         return prepared
@@ -2535,7 +2683,7 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     else:
         print(
             f"ИИ-бот запущен для аккаунта {own_label}: обрабатываю входящие "
-            f"текстовые сообщения, фото и стикеры, "
+            f"текстовые сообщения, фото, видео Gemini и стикеры, "
             f"провайдер={config.provider}, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )

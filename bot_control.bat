@@ -28,9 +28,13 @@ if /I "%~1"=="model" goto model_command
 if /I "%~1"=="stop" goto stop
 if /I "%~1"=="status" goto status
 if /I "%~1"=="logs" goto logs
+if /I "%~1"=="web" goto open_web
+if /I "%~1"=="site" goto open_web
+if /I "%~1"=="ui" goto open_web
+if /I "%~1"=="open" goto open_web
 
 echo Unknown command: %~1
-echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini]^|stop^|status^|logs]
+echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini]^|stop^|status^|logs^|web]
 exit /b 2
 
 :invalid_start_mode
@@ -52,6 +56,7 @@ echo 4. Restart bot (keep current mode)
 echo 5. Stop bot
 echo 6. Show status
 echo 7. Show recent logs
+echo 8. Открыть сайт (веб-панель управления Миланой)
 echo 0. Exit
 echo.
 set /p "CHOICE=Choose an action: "
@@ -62,6 +67,7 @@ if "%CHOICE%"=="4" goto restart
 if "%CHOICE%"=="5" goto stop
 if "%CHOICE%"=="6" goto status
 if "%CHOICE%"=="7" goto logs
+if "%CHOICE%"=="8" goto open_web
 if "%CHOICE%"=="0" goto done
 echo Invalid choice.
 goto menu_pause
@@ -372,6 +378,35 @@ if exist "%OUT_LOG%" (
     "%PS%" -NoProfile -Command "Get-Content -Encoding utf8 -LiteralPath '%OUT_LOG%' -Tail 20"
 )
 if not exist "%ERR_LOG%" if not exist "%OUT_LOG%" echo No logs yet.
+goto action_done
+
+:open_web
+set "WEB_SCRIPT=%ROOT%milana_web.py"
+if not exist "%PYTHON%" (
+    echo Web UI unavailable: Python environment not found: %PYTHON%
+    goto action_done
+)
+if not exist "%WEB_SCRIPT%" (
+    echo Web UI script not found: %WEB_SCRIPT%
+    goto action_done
+)
+
+echo Starting local web control panel for Milana...
+echo.
+
+rem Start the server in a minimized console window.
+rem --no-browser tells Python NOT to open a browser itself (prevents two tabs).
+start "Milana Web UI" /min "%PYTHON%" "%WEB_SCRIPT%" --no-browser
+
+rem Give the HTTP server a bit of time to start listening (usually under 1 second).
+timeout /t 3 /nobreak >nul 2>&1
+
+rem Open browser - only once, after the wait.
+start "" "http://127.0.0.1:8765/"
+
+echo Opened: http://127.0.0.1:8765/
+echo If the page shows a connection error, wait 1-2 seconds and press F5 to refresh.
+echo (To stop the panel: restore the minimized "Milana Web UI" window and press Ctrl+C there)
 goto action_done
 
 :read_pid

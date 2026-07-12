@@ -2,6 +2,7 @@ import asyncio
 import base64
 import copy
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -10,9 +11,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
-from agy_provider import AgyError, AgyModelClient, strip_ansi
+from agy_provider import AgyAuthError, AgyError, AgyModelClient, strip_ansi
 
 
 class StripAnsiTests(unittest.TestCase):
@@ -87,6 +88,231 @@ class AgyModelClientTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["-p", "короткий prompt"])
         self.assertIn("42s", command)
 
+    def test_query_uses_inline_text_without_request_file_or_dangerous_flag(self) -> None:
+        client = AgyModelClient()
+        observed: dict[str, Any] = {}
+
+        def fake_run_windows(
+            command: list[str],
+            workspace: Path,
+            cancel_event: threading.Event | None,
+            *,
+            stop_on_structured_output: bool,
+        ) -> str:
+            observed["command"] = command
+            observed["request_exists"] = (workspace / "request.json").exists()
+            observed["cancel_event"] = cancel_event
+            observed["stop_on_structured_output"] = stop_on_structured_output
+            return '{"messages":["готово"],"reaction":null}'
+
+        request = {
+            "instructions": "Отвечай кратко",
+            "input": [{"role": "user", "content": "Привет"}],
+            "text": {"format": {}},
+        }
+        with (
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch.object(client, "_run_windows", side_effect=fake_run_windows),
+        ):
+            answer = client._query(request)
+
+        command = observed["command"]
+        self.assertEqual(answer, '{"messages":["готово"],"reaction":null}')
+        self.assertFalse(observed["request_exists"])
+        self.assertIsNone(observed["cancel_event"])
+        self.assertTrue(observed["stop_on_structured_output"])
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertEqual(command[-2], "-p")
+        self.assertIn("REQUEST_JSON:", command[-1])
+        self.assertIn('"instructions":"Отвечай кратко"', command[-1])
+        self.assertNotIn("Read the request file", command[-1])
+
+    def test_query_falls_back_to_request_file_for_oversized_text(self) -> None:
+        client = AgyModelClient()
+        observed: dict[str, Any] = {}
+
+        def fake_run_windows(
+            command: list[str],
+            workspace: Path,
+            cancel_event: threading.Event | None,
+            *,
+            stop_on_structured_output: bool,
+        ) -> str:
+            request_path = workspace / "request.json"
+            observed["command"] = command
+            observed["request_exists"] = request_path.exists()
+            observed["payload"] = json.loads(request_path.read_text(encoding="utf-8"))
+            observed["stop_on_structured_output"] = stop_on_structured_output
+            return "готово"
+
+        long_text = "я" * 25_000
+        with (
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch.object(client, "_run_windows", side_effect=fake_run_windows),
+        ):
+            answer = client._query(
+                {"input": [{"role": "user", "content": long_text}]}
+            )
+
+        command = observed["command"]
+        self.assertEqual(answer, "готово")
+        self.assertTrue(observed["request_exists"])
+        self.assertEqual(observed["payload"]["input"][0]["content"], long_text)
+        self.assertFalse(observed["stop_on_structured_output"])
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertIn("Read the request file", command[-1])
+
+    def test_query_falls_back_to_request_file_for_image(self) -> None:
+        client = AgyModelClient()
+        image_bytes = b"\x89PNG\r\n\x1a\nimage"
+        observed: dict[str, Any] = {}
+
+        def fake_run_windows(
+            command: list[str],
+            workspace: Path,
+            cancel_event: threading.Event | None,
+            *,
+            stop_on_structured_output: bool,
+        ) -> str:
+            request_path = workspace / "request.json"
+            payload = json.loads(request_path.read_text(encoding="utf-8"))
+            image_item = payload["input"][0]["content"][1]
+            observed["command"] = command
+            observed["request_exists"] = request_path.exists()
+            observed["image_item"] = image_item
+            observed["image_bytes"] = Path(image_item["local_path"]).read_bytes()
+            return "описание изображения"
+
+        request = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Что здесь?"},
+                        {
+                            "type": "input_image",
+                            "image_url": (
+                                "data:image/png;base64,"
+                                + base64.b64encode(image_bytes).decode("ascii")
+                            ),
+                        },
+                    ],
+                }
+            ]
+        }
+        with (
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch.object(client, "_run_windows", side_effect=fake_run_windows),
+        ):
+            answer = client._query(request)
+
+        command = observed["command"]
+        self.assertEqual(answer, "описание изображения")
+        self.assertTrue(observed["request_exists"])
+        self.assertEqual(observed["image_bytes"], image_bytes)
+        self.assertNotIn("image_url", observed["image_item"])
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertIn("Read the request file", command[-1])
+
+    def test_query_falls_back_to_request_file_for_video(self) -> None:
+        client = AgyModelClient()
+        video_bytes = b"\x1aE\xdf\xa3webm-video"
+        observed: dict[str, Any] = {}
+
+        def fake_run_windows(
+            command: list[str],
+            workspace: Path,
+            cancel_event: threading.Event | None,
+            *,
+            stop_on_structured_output: bool,
+        ) -> str:
+            request_path = workspace / "request.json"
+            payload = json.loads(request_path.read_text(encoding="utf-8"))
+            video_item = payload["input"][0]["content"][1]
+            observed["command"] = command
+            observed["request_exists"] = request_path.exists()
+            observed["video_item"] = video_item
+            observed["video_bytes"] = Path(video_item["local_path"]).read_bytes()
+            return "описание видео"
+
+        request = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Что происходит?"},
+                        {
+                            "type": "input_video",
+                            "video_url": (
+                                "data:video/webm;base64,"
+                                + base64.b64encode(video_bytes).decode("ascii")
+                            ),
+                        },
+                    ],
+                }
+            ]
+        }
+        with (
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch.object(client, "_run_windows", side_effect=fake_run_windows),
+        ):
+            answer = client._query(request)
+
+        command = observed["command"]
+        self.assertEqual(answer, "описание видео")
+        self.assertTrue(observed["request_exists"])
+        self.assertEqual(observed["video_bytes"], video_bytes)
+        self.assertNotIn("video_url", observed["video_item"])
+        self.assertEqual(observed["video_item"]["mime_type"], "video/webm")
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertIn("Read the request file", command[-1])
+
+    def test_inline_budget_counts_full_quoted_command_in_utf16_units(self) -> None:
+        command = ["agy", "-p", 'ответ 😀 с "кавычками"']
+        command_line = subprocess.list2cmdline(command)
+        utf16_units = len(command_line.encode("utf-16-le")) // 2 + 1
+
+        self.assertGreater(utf16_units, len(command_line) + 1)
+        with (
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch("agy_provider.WINDOWS_INLINE_COMMAND_MAX_UNITS", utf16_units),
+        ):
+            self.assertTrue(AgyModelClient._inline_command_fits(command))
+        with (
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch(
+                "agy_provider.WINDOWS_INLINE_COMMAND_MAX_UNITS", utf16_units - 1
+            ),
+        ):
+            self.assertFalse(AgyModelClient._inline_command_fits(command))
+
+    def test_auth_retry_environment_values_and_validation(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"AGY_AUTH_RETRIES": "3", "AGY_AUTH_RETRY_DELAY_SECONDS": "0.25"},
+        ):
+            client = AgyModelClient()
+
+        self.assertEqual(client.auth_retries, 3)
+        self.assertEqual(client.auth_retry_delay_seconds, 0.25)
+
+        invalid_values = (
+            ("AGY_AUTH_RETRIES", "many", "целым числом"),
+            ("AGY_AUTH_RETRIES", "6", "от 0 до 5"),
+            ("AGY_AUTH_RETRY_DELAY_SECONDS", "fast", "должен быть числом"),
+            ("AGY_AUTH_RETRY_DELAY_SECONDS", "31", "от 0 до 30"),
+        )
+        for name, value, expected_message in invalid_values:
+            environment = {
+                "AGY_AUTH_RETRIES": "2",
+                "AGY_AUTH_RETRY_DELAY_SECONDS": "1",
+                name: value,
+            }
+            with self.subTest(name=name, value=value):
+                with patch.dict(os.environ, environment):
+                    with self.assertRaisesRegex(ValueError, expected_message):
+                        AgyModelClient()
+
     def test_launcher_prompt_contains_absolute_request_path(self) -> None:
         client = AgyModelClient()
         with TemporaryDirectory() as directory:
@@ -96,6 +322,7 @@ class AgyModelClientTests(unittest.TestCase):
 
         self.assertIn(f'"{request_path.resolve().as_posix()}"', prompt)
         self.assertIn("Return only one JSON object", prompt)
+        self.assertIn("local media files", prompt)
 
     def test_request_payload_materializes_image_data_url(self) -> None:
         client = AgyModelClient()
@@ -127,6 +354,77 @@ class AgyModelClientTests(unittest.TestCase):
             local_path = Path(image_item["local_path"])
             self.assertTrue(local_path.is_absolute())
             self.assertEqual(local_path.read_bytes(), image_bytes)
+
+    def test_request_payload_materializes_video_data_url(self) -> None:
+        client = AgyModelClient()
+        video_bytes = b"\x00\x00\x00\x18ftypmp42video"
+        request = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_video",
+                            "video_url": (
+                                "data:video/mp4;base64,"
+                                + base64.b64encode(video_bytes).decode("ascii")
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            payload = client._request_payload(request, workspace)
+            video_item = payload["input"][0]["content"][0]
+
+            self.assertNotIn("video_url", video_item)
+            self.assertEqual(video_item["mime_type"], "video/mp4")
+            local_path = Path(video_item["local_path"])
+            self.assertTrue(local_path.is_absolute())
+            self.assertEqual(local_path.suffix, ".mp4")
+            self.assertEqual(local_path.read_bytes(), video_bytes)
+
+    def test_request_payload_rejects_invalid_or_mismatched_video_data(self) -> None:
+        client = AgyModelClient()
+        invalid_items = (
+            (
+                {
+                    "type": "input_video",
+                    "video_url": "data:video/webm;base64,",
+                },
+                "Некорректный data URL видео",
+            ),
+            (
+                {
+                    "type": "input_video",
+                    "video_url": "data:video/webm;base64,not-base64!",
+                },
+                "Некорректные данные видео",
+            ),
+            (
+                {
+                    "type": "input_video",
+                    "video_url": "data:image/png;base64,aW1hZ2U=",
+                },
+                "не соответствует input_video",
+            ),
+        )
+
+        for item, expected_message in invalid_items:
+            with self.subTest(item=item):
+                with TemporaryDirectory() as directory:
+                    with self.assertRaisesRegex(AgyError, expected_message):
+                        client._request_payload(
+                            {
+                                "input": [
+                                    {"role": "user", "content": [item]}
+                                ]
+                            },
+                            Path(directory),
+                        )
 
     def test_request_payload_adds_diary_output_without_mutating_request(self) -> None:
         client = AgyModelClient()
@@ -284,6 +582,35 @@ class AgyModelClientTests(unittest.TestCase):
         process.terminate.assert_not_called()
         process.close.assert_called_once_with(force=True)
 
+    def test_windows_pty_returns_complete_json_before_process_exits(self) -> None:
+        client = AgyModelClient(timeout_seconds=10)
+        process, state = self._alive_process()
+        process.exitstatus = None
+        process.read.return_value = '{"messages":["быстро"],"reaction":null}'
+        winpty_module, _ = self._fake_winpty_module(process)
+
+        with (
+            TemporaryDirectory() as directory,
+            patch.dict(sys.modules, {"winpty": winpty_module}),
+            patch(
+                "agy_provider.select.select",
+                return_value=([process.fileobj], [], []),
+            ) as select_call,
+            patch("agy_provider.time.monotonic", side_effect=[0.0, 0.0]),
+        ):
+            output = client._run_windows(
+                ["agy"],
+                Path(directory),
+                stop_on_structured_output=True,
+            )
+
+        self.assertEqual(output, '{"messages":["быстро"],"reaction":null}')
+        self.assertFalse(state["alive"])
+        select_call.assert_called_once()
+        process.read.assert_called_once()
+        process.terminate.assert_called_once_with(force=True)
+        process.close.assert_called_once_with(force=True)
+
 
 class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_delegates_blocking_query_to_thread(self) -> None:
@@ -308,6 +635,92 @@ class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.output_text, "готовый ответ")
         self.assertEqual(response.output, [])
         self.assertEqual(response.status, "completed")
+
+    async def test_create_retries_auth_errors_with_incremental_delays(self) -> None:
+        client = AgyModelClient(
+            auth_retries=2,
+            auth_retry_delay_seconds=0.25,
+        )
+        request = {"input": [{"role": "user", "content": "Привет"}]}
+
+        with (
+            patch(
+                "agy_provider.asyncio.to_thread",
+                new_callable=AsyncMock,
+                side_effect=[
+                    AgyAuthError("первая попытка"),
+                    AgyAuthError("вторая попытка"),
+                    "готовый ответ",
+                ],
+            ) as to_thread,
+            patch(
+                "agy_provider.asyncio.sleep", new_callable=AsyncMock
+            ) as retry_sleep,
+        ):
+            response = await client.responses.create(**request)
+
+        self.assertEqual(response.output_text, "готовый ответ")
+        self.assertEqual(to_thread.await_count, 3)
+        self.assertEqual(
+            retry_sleep.await_args_list,
+            [call(0.25), call(0.5)],
+        )
+
+    async def test_auth_retry_holds_lock_across_concurrent_requests(self) -> None:
+        client = AgyModelClient(
+            auth_retries=1,
+            auth_retry_delay_seconds=0.25,
+        )
+        retry_sleep_started = asyncio.Event()
+        allow_retry = asyncio.Event()
+        attempts: dict[str, int] = {"first": 0, "second": 0}
+        call_order: list[str] = []
+
+        async def fake_create_once(request: dict[str, Any]) -> str:
+            label = request["input"][0]["content"]
+            attempts[label] += 1
+            call_order.append(label)
+            if label == "first" and attempts[label] == 1:
+                raise AgyAuthError("нужен повтор")
+            return f"answer-{label}"
+
+        async def hold_retry_sleep(delay: float) -> None:
+            self.assertEqual(delay, 0.25)
+            retry_sleep_started.set()
+            await allow_retry.wait()
+
+        with (
+            patch.object(
+                client.responses,
+                "_create_once",
+                new_callable=AsyncMock,
+                side_effect=fake_create_once,
+            ),
+            patch("agy_provider.asyncio.sleep", side_effect=hold_retry_sleep),
+        ):
+            first = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "first"}]
+                )
+            )
+            await asyncio.wait_for(retry_sleep_started.wait(), timeout=1)
+            second = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "second"}]
+                )
+            )
+
+            done, _ = await asyncio.wait({second}, timeout=0.02)
+            self.assertFalse(done)
+            self.assertEqual(call_order, ["first"])
+
+            allow_retry.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(first_result, "answer-first")
+        self.assertEqual(second_result, "answer-second")
+        self.assertEqual(call_order, ["first", "first", "second"])
+        self.assertEqual(attempts, {"first": 2, "second": 1})
 
     async def test_plain_request_preserves_fenced_json_as_plain_text(self) -> None:
         client = AgyModelClient()

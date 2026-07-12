@@ -43,6 +43,7 @@ from telegram_client import (
     split_telegram_text,
     telegram_image_mime_type,
     telegram_sticker_info,
+    telegram_video_mime_type,
 )
 
 
@@ -106,6 +107,7 @@ def make_responder(
     memory=None,
     randint=None,
     message_flow: MessageFlowConfig | None = None,
+    provider: str = "openai",
 ):
     client = MagicMock()
     client.side_effect = AsyncMock(return_value=None)
@@ -124,6 +126,7 @@ def make_responder(
         temperature=0.2,
         max_output_tokens=100,
         message_flow=message_flow or MessageFlowConfig(),
+        provider=provider,
     )
     responder = MilanaMessageResponder(
         client,
@@ -153,9 +156,14 @@ def make_event(
     sticker_emoji: str | None = None,
     sticker_thumbs: list[object] | None = None,
     thumbnail_bytes: bytes | None = b"\xff\xd8\xffpreview",
+    file_size: int | None = None,
 ):
     file_info = (
-        SimpleNamespace(mime_type=mime_type, emoji=sticker_emoji)
+        SimpleNamespace(
+            mime_type=mime_type,
+            emoji=sticker_emoji,
+            size=len(image_bytes) if file_size is None else file_size,
+        )
         if mime_type is not None or sticker
         else None
     )
@@ -391,6 +399,33 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(telegram_image_mime_type(photo), "image/jpeg")
         self.assertEqual(telegram_image_mime_type(document), "image/png")
         self.assertIsNone(telegram_image_mime_type(unsupported))
+
+    def test_detects_supported_gemini_videos_and_excludes_stickers(self) -> None:
+        mp4 = SimpleNamespace(
+            file=SimpleNamespace(mime_type="video/mp4"),
+            sticker=None,
+            message=None,
+        )
+        quicktime = SimpleNamespace(
+            file=SimpleNamespace(mime_type="video/quicktime"),
+            sticker=None,
+            message=None,
+        )
+        sticker = SimpleNamespace(
+            file=SimpleNamespace(mime_type="video/webm"),
+            sticker=object(),
+            message=None,
+        )
+        unsupported = SimpleNamespace(
+            file=SimpleNamespace(mime_type="video/ogg"),
+            sticker=None,
+            message=None,
+        )
+
+        self.assertEqual(telegram_video_mime_type(mp4), "video/mp4")
+        self.assertEqual(telegram_video_mime_type(quicktime), "video/mov")
+        self.assertIsNone(telegram_video_mime_type(sticker))
+        self.assertIsNone(telegram_video_mime_type(unsupported))
 
     def test_detects_sticker_kind_emoji_and_raster_thumbnail(self) -> None:
         raster_thumb = types.PhotoSize(type="m", w=320, h=320, size=4096)
@@ -1455,6 +1490,81 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content[0]["text"], "неизвестно: Как тебе?")
         self.assertEqual(content[1]["image_url"], "data:image/png;base64,cG5n")
 
+    async def test_gemini_video_without_caption_is_sent_as_original_video(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="video/mp4",
+            image_bytes=b"small-mp4-video",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["type"], "input_video")
+        self.assertEqual(
+            content[0]["video_url"],
+            "data:video/mp4;base64,c21hbGwtbXA0LXZpZGVv",
+        )
+        self.assertEqual(
+            content[1],
+            {"type": "input_text", "text": "неизвестно: [видео без подписи]"},
+        )
+
+    async def test_gemini_video_caption_is_included_after_video(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="Посмотри до конца",
+            mime_type="video/webm",
+            image_bytes=b"webm-video",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["type"], "input_video")
+        self.assertTrue(content[0]["video_url"].startswith("data:video/webm;base64,"))
+        self.assertEqual(content[1]["text"], "неизвестно: Посмотри до конца")
+
+    async def test_gemini_oversized_video_is_not_downloaded(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="video/mp4",
+            file_size=20 * 1024 * 1024,
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_not_awaited()
+        model_client.responses.create.assert_not_awaited()
+
+    async def test_broken_captioned_gemini_video_reaches_model_as_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="Что думаешь?",
+            mime_type="video/mp4",
+        )
+        event.message.download_media.side_effect = OSError("download failed")
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content, "неизвестно: Что думаешь?")
+
     async def test_static_webp_sticker_is_sent_as_original_image(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, _, openai_client = make_responder(clock)
@@ -1609,6 +1719,58 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
         self.assertEqual(content[0]["text"], "неизвестно: [видеостикер; эмодзи: 🔥]")
         self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,"))
+
+    async def test_gemini_video_sticker_is_sent_as_original_webm(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="video/webm",
+            image_bytes=b"original-webm-sticker",
+            sticker=True,
+            sticker_emoji="🎉",
+            sticker_thumbs=[SimpleNamespace(type="x")],
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["type"], "input_video")
+        self.assertTrue(content[0]["video_url"].startswith("data:video/webm;base64,"))
+        self.assertEqual(
+            content[1]["text"],
+            "неизвестно: [видеостикер; эмодзи: 🎉]",
+        )
+
+    async def test_broken_gemini_video_sticker_falls_back_to_thumbnail(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="video/webm",
+            sticker=True,
+            sticker_emoji="🔥",
+            sticker_thumbs=[SimpleNamespace(type="x")],
+        )
+        event.message.download_media.side_effect = [
+            OSError("source unavailable"),
+            b"\x89PNG\r\n\x1a\npreview",
+        ]
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        self.assertEqual(
+            event.message.download_media.await_args_list,
+            [call(file=bytes), call(file=bytes, thumb="x")],
+        )
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["type"], "input_text")
+        self.assertEqual(content[1]["type"], "input_image")
 
     async def test_non_sticker_webm_without_caption_is_still_ignored(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -2014,6 +2176,36 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             limit=None,
             max_id=13,
             reverse=True,
+        )
+
+    async def test_gemini_imports_captionless_video_history_as_placeholder(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, model_client = make_responder(clock, provider="gemini")
+        historical_video = SimpleNamespace(
+            id=9,
+            raw_text="",
+            out=False,
+            sender_id=200,
+            photo=None,
+            sticker=None,
+            file=SimpleNamespace(mime_type="video/mp4"),
+            date=clock.value,
+            get_sender=AsyncMock(return_value=None),
+        )
+
+        async def iter_history():
+            yield historical_video
+
+        client.iter_messages.return_value = iter_history()
+        event = make_event(clock.value, text="Новый вопрос", message_id=10)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        request_input = model_client.responses.create.await_args.kwargs["input"]
+        self.assertEqual(
+            request_input[0],
+            {"role": "user", "content": "неизвестно: [видео без подписи]"},
         )
 
     async def test_retries_without_temperature_when_model_rejects_it(self) -> None:
