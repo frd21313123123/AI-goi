@@ -423,8 +423,10 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         instructions = openai_client.responses.create.await_args.kwargs["instructions"]
         self.assertIn("режим прямого общения", instructions.lower())
         self.assertNotIn("актуальный бытовой контекст", instructions.lower())
-        event.reply.assert_awaited_once_with("Первая часть")
-        client.send_message.assert_awaited_once_with(100, "Вторая часть")
+        event.reply.assert_not_awaited()
+        client.send_message.assert_has_awaits(
+            [call(100, "Первая часть"), call(100, "Вторая часть")]
+        )
 
     async def test_typing_action_covers_generation_and_sending(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -447,12 +449,13 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(action_active)
             return structured_response("Готовый ответ")
 
-        async def reply_while_typing(text: str):
+        async def send_while_typing(chat_id: int, text: str):
+            self.assertEqual(chat_id, 100)
             self.assertTrue(action_active)
             return SimpleNamespace(id=301)
 
         openai_client.responses.create.side_effect = generate_while_typing
-        event.reply.side_effect = reply_while_typing
+        client.send_message.side_effect = send_while_typing
 
         with patch("builtins.print"):
             await responder.process(event)
@@ -526,7 +529,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(serialized.count("Второе сообщение"), 1)
         self.assertLess(serialized.index("Первое сообщение"), serialized.index("Второе сообщение"))
         first.reply.assert_not_awaited()
-        second.reply.assert_awaited_once_with("Готовый ответ")
+        second.reply.assert_not_awaited()
+        client.send_message.assert_awaited_once_with(100, "Готовый ответ")
         client.send_read_acknowledge.assert_awaited_once_with(
             "peer",
             message=second.message,
@@ -603,7 +607,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(worker, timeout=1)
 
         openai_client.responses.create.assert_awaited_once()
-        second.reply.assert_awaited_once_with("Готовый ответ")
+        second.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_message_during_quiet_cleanup_starts_a_fresh_quiet_wait(self) -> None:
         class SlowCancelEvent(asyncio.Event):
@@ -665,7 +670,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(worker, timeout=1)
 
         openai_client.responses.create.assert_awaited_once()
-        second.reply.assert_awaited_once_with("Готовый ответ")
+        second.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_large_out_of_order_batch_is_sorted_deduplicated_and_multimodal(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -735,7 +741,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed_texts, expected_texts)
         self.assertEqual(image_items, 2)
         self.assertNotIn("duplicate-must-not-reach-model", str(request_input))
-        events_by_id[1033].reply.assert_awaited_once()
+        events_by_id[1033].reply.assert_not_awaited()
+        client.send_message.assert_awaited_once_with(100, "Готовый ответ")
         for message_id, event in events_by_id.items():
             if message_id != 1033:
                 event.reply.assert_not_awaited()
@@ -793,7 +800,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         for text in ("До фото", "Подпись у недоступного фото", "После фото"):
             self.assertEqual(serialized.count(text), 1)
         self.assertNotIn("input_image", serialized)
-        last.reply.assert_awaited_once_with("Готовый ответ")
+        last.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_message_received_during_schedule_wait_joins_the_same_batch(self) -> None:
         clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -822,7 +830,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_input.count("Первая часть"), 1)
         self.assertEqual(request_input.count("Вторая часть"), 1)
         first.reply.assert_not_awaited()
-        second.reply.assert_awaited_once_with("Готовый ответ")
+        second.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_shutdown_cancels_waiting_workers_and_rejects_new_events(self) -> None:
         clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -902,7 +911,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(serialized.count("Дополнение"), 1)
         self.assertNotIn("stale-diary", serialized)
         first.reply.assert_not_awaited()
-        second.reply.assert_awaited_once_with("Актуальный ответ")
+        second.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Актуальный ответ")
         self.assertEqual(responder.memory.get_diary(), [])
         self.assertEqual(
             [
@@ -929,14 +939,18 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             "Вторая мысль",
         )
         event = make_event(clock.value)
-        event.reply.return_value = SimpleNamespace(id=401)
-        client.send_message.return_value = SimpleNamespace(id=402)
+        client.send_message.side_effect = [
+            SimpleNamespace(id=401),
+            SimpleNamespace(id=402),
+        ]
 
         with patch("builtins.print"):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Первая мысль")
-        client.send_message.assert_awaited_once_with(100, "Вторая мысль")
+        event.reply.assert_not_awaited()
+        client.send_message.assert_has_awaits(
+            [call(100, "Первая мысль"), call(100, "Вторая мысль")]
+        )
         request = openai_client.responses.create.await_args.kwargs
         self.assertEqual(
             request["text"]["format"]["schema"]["properties"]["messages"]["maxItems"],
@@ -993,9 +1007,11 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
                     worker.cancel()
                     await asyncio.gather(worker, return_exceptions=True)
 
-        first.reply.assert_awaited_once_with("Отправленный префикс")
-        second.reply.assert_awaited_once_with("Новое продолжение")
-        client.send_message.assert_not_awaited()
+        first.reply.assert_not_awaited()
+        second.reply.assert_not_awaited()
+        client.send_message.assert_has_awaits(
+            [call(100, "Отправленный префикс"), call(100, "Новое продолжение")]
+        )
         self.assertEqual(openai_client.responses.create.await_count, 2)
         continuation_input = openai_client.responses.create.await_args_list[-1].kwargs[
             "input"
@@ -1027,14 +1043,18 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             "Неотправленный остаток",
         )
         event = make_event(clock.value)
-        event.reply.return_value = SimpleNamespace(id=601)
-        client.send_message.side_effect = OSError("Telegram недоступен")
+        client.send_message.side_effect = [
+            SimpleNamespace(id=601),
+            OSError("Telegram недоступен"),
+        ]
 
         with patch("builtins.print"):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Успешный префикс")
-        client.send_message.assert_awaited_once_with(100, "Неотправленный остаток")
+        event.reply.assert_not_awaited()
+        client.send_message.assert_has_awaits(
+            [call(100, "Успешный префикс"), call(100, "Неотправленный остаток")]
+        )
         responder.presence.finish_response.assert_awaited_once_with(answered=True)
         assistant_messages = [
             item
@@ -1057,7 +1077,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clock.delays, [2, 2])
         client.send_read_acknowledge.assert_awaited_once()
         openai_client.responses.create.assert_awaited_once()
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
         instructions = openai_client.responses.create.await_args.kwargs["instructions"]
         self.assertIn("состояние «Свободное время»", instructions)
 
@@ -1091,7 +1112,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(clock.delays, [7 * 60 * 60 + 45 * 60 + 15, 2])
         client.send_read_acknowledge.assert_awaited_once()
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
         instructions = openai_client.responses.create.await_args.kwargs["instructions"]
         self.assertIn("состояние «Утренние сборы»", instructions)
 
@@ -1125,7 +1147,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(content[1]["type"], "input_image")
         self.assertEqual(content[1]["image_url"], "data:image/jpeg;base64,anBlZw==")
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_photo_caption_is_included_with_image(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -1188,7 +1211,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generation_started_at, [expected_start])
         self.assertEqual(clock.delays, [10, 2])
         client.send_read_acknowledge.assert_awaited_once()
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_answer_keeps_presence_online_for_thirty_to_sixty_seconds(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -1264,7 +1288,12 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             event = make_event(clock.value, message_id=301)
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        self.assertEqual(responder.client.send_message.await_count, 2)
+        self.assertEqual(
+            responder.client.send_message.await_args_list[-1],
+            call(100, "Готовый ответ"),
+        )
         self.assertGreater(responder.presence.sleep_deferred_until, deadline)
 
     async def test_presence_spontaneously_goes_online_for_a_few_minutes(self) -> None:
@@ -1419,7 +1448,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, _, _ = make_responder(clock)
         event = make_event(clock.value)
-        event.reply.side_effect = OSError("Telegram недоступен")
+        responder.client.send_message.side_effect = OSError("Telegram недоступен")
 
         with patch("builtins.print"):
             await responder.process(event)
@@ -1437,7 +1466,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await responder.process(event)
 
         openai_client.responses.create.assert_awaited_once()
-        event.reply.assert_awaited_once()
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_imports_existing_telegram_history_before_first_answer(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -1521,7 +1551,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             "temperature",
             openai_client.responses.create.await_args_list[1].kwargs,
         )
-        event.reply.assert_awaited_once_with("Ответ без temperature")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Ответ без temperature")
 
     async def test_retries_as_one_plain_message_when_structured_output_is_unsupported(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -1547,7 +1578,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             "Верни только один готовый текст Telegram-сообщения без JSON",
             openai_client.responses.create.await_args_list[1].kwargs["instructions"],
         )
-        event.reply.assert_awaited_once_with("Обычный ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Обычный ответ")
 
     async def test_structured_schema_error_is_not_misread_as_unsupported(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -1742,7 +1774,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         ):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
         responder.presence.finish_response.assert_awaited_once_with(answered=True)
         commit_diary.assert_called_once()
         self.assertEqual(
@@ -1767,7 +1800,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Не могу помочь")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Не могу помочь")
 
     async def test_message_can_be_read_without_reply_or_reaction(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -1851,12 +1885,13 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         async def react(request):
             actions.append(f"reaction:{request.reaction[0].emoticon}")
 
-        async def reply(text):
+        async def send_message(chat_id, text):
+            self.assertEqual(chat_id, 100)
             actions.append(f"text:{text}")
             return SimpleNamespace(id=401)
 
         client.side_effect = react
-        event.reply.side_effect = reply
+        client.send_message.side_effect = send_message
 
         with patch("builtins.print"):
             await responder.process(event)
@@ -1883,7 +1918,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print") as output:
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Всё равно отвечу")
+        event.reply.assert_not_awaited()
+        client.send_message.assert_awaited_once_with(100, "Всё равно отвечу")
         self.assertTrue(
             any("Ошибка реакции" in str(call) for call in output.call_args_list)
         )
@@ -1955,7 +1991,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await responder.process(first)
 
         first.reply.assert_not_awaited()
-        second.reply.assert_awaited_once_with("Актуальный ответ")
+        second.reply.assert_not_awaited()
+        client.send_message.assert_awaited_once_with(100, "Актуальный ответ")
         self.assertEqual(openai_client.responses.create.await_count, 2)
 
     async def test_unknown_reaction_is_not_sent(self) -> None:
@@ -2005,8 +2042,10 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Первая часть")
-        client.send_message.assert_awaited_once_with(100, "Вторая часть")
+        event.reply.assert_not_awaited()
+        client.send_message.assert_has_awaits(
+            [call(100, "Первая часть"), call(100, "Вторая часть")]
+        )
 
     async def test_invalid_structured_json_is_not_sent(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -2090,7 +2129,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         event.reply.assert_not_awaited()
         self.assertEqual([item.role for item in responder.memory.get_chat_history(100)], ["user"])
 
-    async def test_multi_part_answer_uses_reply_then_send_message(self) -> None:
+    async def test_multi_part_answer_uses_plain_messages(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)
         openai_client.responses.create.return_value = structured_response("a" * 4001)
@@ -2099,8 +2138,10 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("a" * 4000)
-        client.send_message.assert_awaited_once_with(100, "a")
+        event.reply.assert_not_awaited()
+        client.send_message.assert_has_awaits(
+            [call(100, "a" * 4000), call(100, "a")]
+        )
         assistant_parts = [
             item.content
             for item in responder.memory.get_chat_history(100)
@@ -2117,7 +2158,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        event.reply.assert_awaited_once_with("Готовый ответ")
+        event.reply.assert_not_awaited()
+        responder.client.send_message.assert_awaited_once_with(100, "Готовый ответ")
 
     async def test_dynamic_summary_starts_at_60_and_is_used_by_that_answer(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))

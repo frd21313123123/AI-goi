@@ -1969,10 +1969,7 @@ class MilanaMessageResponder:
                 )
 
             try:
-                if index == 0:
-                    sent = await reply_event.reply(part)
-                else:
-                    sent = await self.client.send_message(reply_event.chat_id, part)
+                sent = await self.client.send_message(reply_event.chat_id, part)
             except (RPCError, OSError, TypeError, ValueError) as exc:
                 print(
                     f"Ошибка отправки части ответа на message_id={reply_event.id}: "
