@@ -8,6 +8,7 @@ sessions/
 *.session-journal
 bot.pid
 bot.mode
+llm.choice
 bot-output.log
 bot-error.log
 data/

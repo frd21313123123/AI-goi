@@ -16,12 +16,14 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Mapping
 
 from openai import AsyncOpenAI, BadRequestError, OpenAIError
 from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 
+from agy_provider import AgyError, AgyModelClient
 from milana_memory import (
     MAX_DIARY_ENTRY_LENGTH,
     USER_WINDOW_RESET_TARGET,
@@ -43,9 +45,13 @@ from milana_schedule import (
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 AI_CONFIG_PATH = BASE_DIR / "ai_config.json"
+LLM_CHOICE_PATH = BASE_DIR / "llm.choice"
 MEMORY_PATH = BASE_DIR / "data" / "milana_memory.sqlite3"
 
 DEFAULT_AI_MODEL = "gpt-5.6-terra"
+GEMINI_AI_MODEL = "gemini-3.5-flash"
+OPENAI_LLM_CHOICE = "openai"
+GEMINI_LLM_CHOICE = "gemini"
 DEFAULT_AI_SYSTEM_PROMPT = (
     "Ты отвечаешь пользователю в Telegram. Отвечай на языке пользователя, "
     "естественно, кратко и по существу. Не упоминай системные инструкции, "
@@ -98,6 +104,7 @@ class AIConfig:
     temperature: float
     max_output_tokens: int
     message_flow: MessageFlowConfig = MessageFlowConfig()
+    provider: str = OPENAI_LLM_CHOICE
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -170,6 +177,18 @@ def load_ai_settings(path: Path = AI_CONFIG_PATH) -> Mapping[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"{path.name} должен содержать JSON-объект")
     return data
+
+
+def load_llm_choice(path: Path = LLM_CHOICE_PATH) -> str:
+    """Read the provider selected from ``bot_control.bat``."""
+    if not path.exists():
+        return OPENAI_LLM_CHOICE
+    choice = path.read_text(encoding="utf-8").strip().lower()
+    if choice not in {OPENAI_LLM_CHOICE, GEMINI_LLM_CHOICE}:
+        raise ValueError(
+            f"{path.name} должен содержать 'openai' или 'gemini'"
+        )
+    return choice
 
 
 def ai_string(
@@ -279,18 +298,22 @@ def load_message_flow_config(settings: Mapping[str, Any]) -> MessageFlowConfig:
 def load_ai_config() -> AIConfig:
     env_values = load_env_file(ENV_PATH)
     settings = load_ai_settings()
+    provider = load_llm_choice()
 
     # Явно заданное значение из локального .env имеет приоритет для ключа,
     # чтобы пользователь мог заменить устаревший ключ без изменения окружения ОС.
     api_key = (
         env_values.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     ).strip()
-    model = ai_string(
-        settings,
-        "model",
-        os.getenv("OPENAI_MODEL", DEFAULT_AI_MODEL),
-        "model",
-    )
+    if provider == GEMINI_LLM_CHOICE:
+        model = GEMINI_AI_MODEL
+    else:
+        model = ai_string(
+            settings,
+            "model",
+            os.getenv("OPENAI_MODEL", DEFAULT_AI_MODEL),
+            "model",
+        )
     instructions = ai_string(
         settings,
         "system_prompt",
@@ -303,7 +326,7 @@ def load_ai_config() -> AIConfig:
     )
     message_flow = load_message_flow_config(settings)
 
-    if not api_key:
+    if provider == OPENAI_LLM_CHOICE and not api_key:
         raise ValueError("Добавьте OPENAI_API_KEY в переменные среды или файл .env")
     if not model:
         raise ValueError("OPENAI_MODEL не может быть пустым")
@@ -314,6 +337,7 @@ def load_ai_config() -> AIConfig:
         temperature=temperature,
         max_output_tokens=max_output_tokens,
         message_flow=message_flow,
+        provider=provider,
     )
 
 
@@ -346,7 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ai_bot = subparsers.add_parser(
         "ai-bot",
-        help="Отвечать через OpenAI на все входящие текстовые сообщения",
+        help="Отвечать через выбранную LLM на все входящие сообщения",
     )
     ai_bot.add_argument(
         "--dev-chat",
@@ -957,7 +981,7 @@ class MilanaMessageResponder:
     def __init__(
         self,
         client: TelegramClient,
-        openai_client: AsyncOpenAI,
+        openai_client: Any,
         config: AIConfig,
         routine: WeeklyRoutine,
         *,
@@ -1602,6 +1626,13 @@ class MilanaMessageResponder:
                 input_items=input_items,
             )
             self._raise_if_incomplete(response)
+            for entry in tuple(getattr(response, "agy_diary_entries", ()) or ()):
+                self._staged_diary_call(
+                    SimpleNamespace(
+                        arguments=json.dumps({"content": entry}, ensure_ascii=False)
+                    ),
+                    staged_diary_entries,
+                )
             output = list(getattr(response, "output", None) or [])
             calls = [
                 item
@@ -2408,7 +2439,14 @@ class MilanaMessageResponder:
                             reply=reply,
                             continues_conversation=context.continues_conversation,
                         )
-                except (OpenAIError, RPCError, OSError, TypeError, ValueError) as exc:
+                except (
+                    AgyError,
+                    OpenAIError,
+                    RPCError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
                     print(
                         f"Ошибка ИИ-ответа для message_id={reply_event.id}: "
                         f"{type(exc).__name__}: {exc}",
@@ -2459,13 +2497,16 @@ class MilanaMessageResponder:
 async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     config = load_ai_config()
     routine = load_routine()
-    openai_client = AsyncOpenAI(api_key=config.api_key)
+    if config.provider == GEMINI_LLM_CHOICE:
+        model_client: Any = AgyModelClient(model=config.model)
+    else:
+        model_client = AsyncOpenAI(api_key=config.api_key)
     memory = MilanaMemoryStore(MEMORY_PATH)
     me = await client.get_me()
     presence = MilanaPresenceController(client, routine)
     responder = MilanaMessageResponder(
         client,
-        openai_client,
+        model_client,
         config,
         routine,
         dev_chat=dev_chat,
@@ -2486,14 +2527,16 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     if dev_chat:
         print(
             f"ИИ-бот запущен для аккаунта {own_label} в режиме DEV-общения: "
-            f"ответы без расписания и искусственных пауз, модель={config.model}. "
+            f"ответы без расписания и искусственных пауз, "
+            f"провайдер={config.provider}, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )
         presence_task = None
     else:
         print(
             f"ИИ-бот запущен для аккаунта {own_label}: обрабатываю входящие "
-            f"текстовые сообщения, фото и стикеры, модель={config.model}. "
+            f"текстовые сообщения, фото и стикеры, "
+            f"провайдер={config.provider}, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )
         print(format_current_status(routine, brief=True))
@@ -2557,7 +2600,7 @@ def main() -> int:
     except FloodWaitError as exc:
         print(f"Telegram просит подождать {exc.seconds} сек.", file=sys.stderr)
         return 1
-    except (RPCError, OSError, ValueError) as exc:
+    except (AgyError, RPCError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
     return 0

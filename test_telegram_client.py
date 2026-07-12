@@ -29,8 +29,10 @@ from telegram_client import (
     display_name,
     image_mime_type_from_bytes,
     inter_message_typing_delay,
+    load_ai_config,
     load_env_file,
     load_ai_settings,
+    load_llm_choice,
     load_message_flow_config,
     message_text,
     normalize_target,
@@ -81,13 +83,19 @@ class GatedClock(AdvancingClock):
         self.value += timedelta(seconds=seconds)
 
 
-def structured_response(*messages: str, reaction: str | None = None, output=None):
+def structured_response(
+    *messages: str,
+    reaction: str | None = None,
+    output=None,
+    agy_diary_entries=(),
+):
     return SimpleNamespace(
         output_text=json.dumps(
             {"messages": list(messages), "reaction": reaction},
             ensure_ascii=False,
         ),
         output=[] if output is None else output,
+        agy_diary_entries=agy_diary_entries,
     )
 
 
@@ -224,6 +232,53 @@ class SplitTelegramTextTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "JSON-объект"):
                 load_ai_settings(path)
+
+    def test_load_llm_choice_defaults_to_openai_when_file_is_missing(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "llm.choice"
+
+            self.assertEqual(load_llm_choice(path), "openai")
+
+    def test_load_llm_choice_reads_openai(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "llm.choice"
+            path.write_text("  OPENAI\n", encoding="utf-8")
+
+            self.assertEqual(load_llm_choice(path), "openai")
+
+    def test_load_llm_choice_reads_gemini(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "llm.choice"
+            path.write_text("gemini", encoding="utf-8")
+
+            self.assertEqual(load_llm_choice(path), "gemini")
+
+    def test_load_llm_choice_rejects_unknown_provider(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "llm.choice"
+            path.write_text("claude", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "openai.*gemini"):
+                load_llm_choice(path)
+
+    def test_load_ai_config_for_gemini_does_not_require_openai_key(self) -> None:
+        settings = {
+            "model": "openai-model-from-config",
+            "system_prompt": "Тестовая инструкция",
+            "temperature": 0.2,
+            "max_output_tokens": 321,
+        }
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("telegram_client.load_env_file", return_value={}),
+            patch("telegram_client.load_ai_settings", return_value=settings),
+            patch("telegram_client.load_llm_choice", return_value="gemini"),
+        ):
+            config = load_ai_config()
+
+        self.assertEqual(config.provider, "gemini")
+        self.assertEqual(config.model, "gemini-3.5-flash")
+        self.assertEqual(config.api_key, "")
 
     def test_max_output_tokens_must_be_an_integer(self) -> None:
         with self.assertRaisesRegex(ValueError, "целым числом"):
@@ -514,6 +569,50 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         presence.run.assert_not_awaited()
         presence.force_offline.assert_not_awaited()
         schedule_status.assert_not_called()
+        responder.shutdown.assert_awaited_once()
+        memory.close.assert_called_once()
+
+    async def test_gemini_runtime_uses_agy_client_instead_of_openai(self) -> None:
+        client = MagicMock()
+        client.get_me = AsyncMock(return_value=SimpleNamespace(username="milana", id=1))
+        client.run_until_disconnected = AsyncMock()
+        client.is_connected.return_value = False
+        config = AIConfig(
+            api_key="",
+            model="gemini-3.5-flash",
+            instructions="Тестовая инструкция",
+            temperature=0.2,
+            max_output_tokens=100,
+            provider="gemini",
+        )
+        routine = load_routine()
+        agy_client = MagicMock()
+        memory = MagicMock()
+        presence = MagicMock()
+        presence.run = AsyncMock()
+        presence.force_offline = AsyncMock()
+        responder = MagicMock()
+        responder.shutdown = AsyncMock()
+
+        with (
+            patch("telegram_client.load_ai_config", return_value=config),
+            patch("telegram_client.load_routine", return_value=routine),
+            patch("telegram_client.AgyModelClient", return_value=agy_client) as agy_type,
+            patch("telegram_client.AsyncOpenAI") as openai_type,
+            patch("telegram_client.MilanaMemoryStore", return_value=memory),
+            patch(
+                "telegram_client.MilanaPresenceController", return_value=presence
+            ),
+            patch(
+                "telegram_client.MilanaMessageResponder", return_value=responder
+            ) as responder_type,
+            patch("builtins.print"),
+        ):
+            await run_ai_bot(client, dev_chat=True)
+
+        agy_type.assert_called_once_with(model="gemini-3.5-flash")
+        openai_type.assert_not_called()
+        self.assertIs(responder_type.call_args.args[1], agy_client)
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
 
@@ -1798,6 +1897,26 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             openai_client.responses.create.await_args_list[2].kwargs["instructions"]
         )
         self.assertIn("Лена предпочитает зелёный чай", other_chat_instructions)
+
+    async def test_agy_diary_entries_are_staged_in_generated_reply(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        openai_client.responses.create.return_value = structured_response(
+            "запомнила",
+            agy_diary_entries=("Лена предпочитает зелёный чай",),
+        )
+
+        reply = await responder._generate_answer(
+            chat_key=100,
+            history_input=[],
+            messages=[],
+        )
+
+        self.assertEqual(reply.messages, ("запомнила",))
+        self.assertEqual(
+            reply.staged_diary_entries,
+            ("Лена предпочитает зелёный чай",),
+        )
 
     async def test_failed_send_does_not_store_assistant_turn(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))

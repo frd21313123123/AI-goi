@@ -8,6 +8,7 @@ set "SCRIPT=%ROOT%telegram_client.py"
 set "SCHEDULE_SCRIPT=%ROOT%milana_schedule.py"
 set "PID_FILE=%ROOT%bot.pid"
 set "MODE_FILE=%ROOT%bot.mode"
+set "LLM_FILE=%ROOT%llm.choice"
 set "OUT_LOG=%ROOT%bot-output.log"
 set "ERR_LOG=%ROOT%bot-error.log"
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -22,12 +23,14 @@ if /I "%~1"=="start" if /I "%~2"=="dev" goto start_dev
 if /I "%~1"=="start" goto invalid_start_mode
 if /I "%~1"=="dev" goto start_dev
 if /I "%~1"=="start-dev" goto start_dev
+if /I "%~1"=="restart" goto restart
+if /I "%~1"=="model" goto model_command
 if /I "%~1"=="stop" goto stop
 if /I "%~1"=="status" goto status
 if /I "%~1"=="logs" goto logs
 
 echo Unknown command: %~1
-echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|stop^|status^|logs]
+echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini]^|stop^|status^|logs]
 exit /b 2
 
 :invalid_start_mode
@@ -44,17 +47,21 @@ call :show_full_status
 echo.
 echo 1. Start bot normally (schedule enabled)
 echo 2. Start DEV chat (immediate replies)
-echo 3. Stop bot
-echo 4. Show status
-echo 5. Show recent logs
+echo 3. Choose LLM model
+echo 4. Restart bot (keep current mode)
+echo 5. Stop bot
+echo 6. Show status
+echo 7. Show recent logs
 echo 0. Exit
 echo.
 set /p "CHOICE=Choose an action: "
 if "%CHOICE%"=="1" goto start
 if "%CHOICE%"=="2" goto start_dev
-if "%CHOICE%"=="3" goto stop
-if "%CHOICE%"=="4" goto status
-if "%CHOICE%"=="5" goto logs
+if "%CHOICE%"=="3" goto model_menu
+if "%CHOICE%"=="4" goto restart
+if "%CHOICE%"=="5" goto stop
+if "%CHOICE%"=="6" goto status
+if "%CHOICE%"=="7" goto logs
 if "%CHOICE%"=="0" goto done
 echo Invalid choice.
 goto menu_pause
@@ -72,6 +79,15 @@ set "START_MODE=DEV chat (immediate replies)"
 goto start_common
 
 :start_common
+call :load_llm_choice
+if /I "%LLM_CHOICE%"=="gemini" (
+    where agy >nul 2>&1
+    if errorlevel 1 (
+        echo Cannot start with Gemini 3.5 Flash: the "agy" command was not found in PATH.
+        echo Install and configure agy, or switch back with: bot_control.bat model openai
+        goto action_done
+    )
+)
 if not exist "%PYTHON%" (
     echo Python environment not found: %PYTHON%
     goto action_done
@@ -112,6 +128,83 @@ echo Error log: %ERR_LOG%
 echo.
 call :show_full_status
 goto action_done
+
+:model_command
+if "%~2"=="" (
+    call :show_llm_choice
+    echo Use: bot_control.bat model [openai^|gemini]
+    exit /b 0
+)
+if not "%~3"=="" goto invalid_model
+if /I "%~2"=="openai" (
+    call :set_llm_choice openai
+    goto action_done
+)
+if /I "%~2"=="gemini" (
+    call :set_llm_choice gemini
+    goto action_done
+)
+
+:invalid_model
+echo Unknown LLM model: %~2
+echo Use: bot_control.bat model [openai^|gemini]
+exit /b 2
+
+:model_menu
+cls
+echo Choose LLM model
+echo.
+call :show_llm_choice
+echo.
+echo 1. OpenAI (model configured in ai_config.json)
+echo 2. Gemini 3.5 Flash (gemini-3.5-flash)
+echo 0. Back
+echo.
+set "MODEL_CHOICE="
+set /p "MODEL_CHOICE=Choose a model: "
+if "%MODEL_CHOICE%"=="1" (
+    call :set_llm_choice openai
+    goto menu_pause
+)
+if "%MODEL_CHOICE%"=="2" (
+    call :set_llm_choice gemini
+    goto menu_pause
+)
+if "%MODEL_CHOICE%"=="0" goto menu
+echo Invalid choice.
+goto menu_pause
+
+:restart
+call :find_bot_pids
+if not defined BOT_PIDS (
+    if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
+    if exist "%MODE_FILE%" del /q "%MODE_FILE%" >nul 2>&1
+    echo Bot is not running. Start it normally or in DEV mode first.
+    goto action_done
+)
+
+call :resolve_bot_mode
+if /I "%BOT_MODE%"=="MIXED" (
+    echo Cannot restart: normal and DEV bot processes are running together.
+    echo Stop them, then start the required mode explicitly.
+    goto action_done
+)
+if /I "%BOT_MODE%"=="UNKNOWN" (
+    echo Cannot restart: the current bot mode could not be determined.
+    echo Stop it, then start the required mode explicitly.
+    goto action_done
+)
+
+set "RESTART_PIDS=%BOT_PIDS%"
+set "RESTART_MODE=%BOT_MODE%"
+for %%P in (%RESTART_PIDS%) do (
+    taskkill /PID %%P /T /F >nul 2>&1
+)
+if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
+if exist "%MODE_FILE%" del /q "%MODE_FILE%" >nul 2>&1
+echo Bot stopped for restart. PID(s):%RESTART_PIDS%
+if /I "%RESTART_MODE%"=="DEV" goto start_dev
+goto start
 
 :stop
 call :find_bot_pids
@@ -155,10 +248,39 @@ if not defined BOT_PIDS (
     for %%P in (%BOT_PIDS%) do call :show_process_details %%P
     call :show_bot_mode
 )
+call :show_llm_choice
 echo.
 call :show_log_status
 echo.
 call :show_detailed_state
+exit /b 0
+
+:load_llm_choice
+set "LLM_CHOICE=openai"
+if not exist "%LLM_FILE%" exit /b 0
+set "SAVED_LLM_CHOICE="
+set /p "SAVED_LLM_CHOICE=" < "%LLM_FILE%"
+if /I "%SAVED_LLM_CHOICE%"=="gemini" set "LLM_CHOICE=gemini"
+exit /b 0
+
+:show_llm_choice
+call :load_llm_choice
+if /I "%LLM_CHOICE%"=="gemini" (
+    echo Configured LLM: Gemini 3.5 Flash - gemini-3.5-flash
+) else (
+    echo Configured LLM: OpenAI - model configured in ai_config.json
+)
+exit /b 0
+
+:set_llm_choice
+call :load_llm_choice
+set "PREVIOUS_LLM_CHOICE=%LLM_CHOICE%"
+> "%LLM_FILE%" <nul set /p "=%~1"
+set "LLM_CHOICE=%~1"
+call :show_llm_choice
+if /I "%PREVIOUS_LLM_CHOICE%"=="%LLM_CHOICE%" exit /b 0
+call :find_bot_pids
+if defined BOT_PIDS echo The bot is running. Restart it to use the newly selected LLM.
 exit /b 0
 
 :resolve_bot_mode
