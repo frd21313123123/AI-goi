@@ -24,6 +24,7 @@ from telegram_client import (
     MessageFlowConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
+    MilanaInitiativeReflector,
     ai_number,
     ai_positive_int,
     ai_string,
@@ -725,6 +726,204 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model_client.openai_model, "gpt-fallback")
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
+
+    async def test_normal_runtime_starts_initiative_event_task(self) -> None:
+        client = MagicMock()
+        client.get_me = AsyncMock(return_value=SimpleNamespace(username="milana", id=1))
+        client.run_until_disconnected = AsyncMock()
+        client.is_connected.return_value = False
+        config = AIConfig(
+            api_key="test-key",
+            model="test-model",
+            instructions="Тестовая инструкция",
+            temperature=0.2,
+            max_output_tokens=100,
+        )
+        routine = load_routine()
+        memory = MagicMock()
+        presence = MagicMock()
+        presence.run = AsyncMock()
+        presence.force_offline = AsyncMock()
+        responder = MagicMock()
+        responder.shutdown = AsyncMock()
+        reflector = MagicMock()
+        reflector.run = AsyncMock()
+
+        with (
+            patch("telegram_client.load_ai_config", return_value=config),
+            patch("telegram_client.load_routine", return_value=routine),
+            patch("telegram_client.AsyncOpenAI", return_value=MagicMock()),
+            patch("telegram_client.MilanaMemoryStore", return_value=memory),
+            patch("telegram_client.MilanaPresenceController", return_value=presence),
+            patch("telegram_client.MilanaMessageResponder", return_value=responder),
+            patch(
+                "telegram_client.MilanaInitiativeReflector",
+                return_value=reflector,
+            ) as reflector_type,
+            patch("builtins.print"),
+        ):
+            await run_ai_bot(client)
+
+        reflector_type.assert_called_once_with(
+            client,
+            unittest.mock.ANY,
+            config,
+            routine,
+            memory,
+            presence,
+        )
+        reflector.run.assert_called_once_with()
+        presence.run.assert_called_once_with()
+        responder.shutdown.assert_awaited_once()
+        memory.close.assert_called_once()
+
+
+class MilanaInitiativeReflectorTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _dialogs(*dialogs):
+        async def iterate():
+            for dialog in dialogs:
+                yield dialog
+
+        return iterate()
+
+    async def test_run_once_waits_random_30_to_90_minutes_before_event(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 18, 29, tzinfo=YEKT))
+        responder, client, model_client = make_responder(clock)
+        randint = MagicMock(return_value=45 * 60)
+        reflector = MilanaInitiativeReflector(
+            client,
+            model_client,
+            responder.config,
+            responder.routine,
+            responder.memory,
+            responder.presence,
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=randint,
+        )
+        reflector.reflect = AsyncMock(return_value=None)
+
+        self.assertIsNone(await reflector.run_once())
+
+        randint.assert_called_once_with(30 * 60, 90 * 60)
+        self.assertEqual(clock.delays, [45 * 60])
+        current, event_at = reflector.reflect.await_args.args
+        self.assertEqual(current.title, "Личные дела")
+        self.assertEqual(event_at, datetime(2026, 7, 13, 19, 14, tzinfo=YEKT))
+
+    async def test_reflection_can_choose_person_and_send_first_message(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 18, 30, tzinfo=YEKT))
+        responder, client, model_client = make_responder(clock)
+        responder.presence.begin_response = AsyncMock()
+        responder.presence.finish_response = AsyncMock()
+        entity = SimpleNamespace(id=100, bot=False, deleted=False, is_self=False)
+        dialog = SimpleNamespace(
+            id=100,
+            name="Лена",
+            entity=entity,
+            is_user=True,
+            message=None,
+        )
+        client.iter_dialogs.return_value = self._dialogs(dialog)
+        client.send_message.return_value = SimpleNamespace(id=901)
+        responder.memory.add_message(
+            100,
+            "user",
+            "Как прошла прогулка?",
+            telegram_message_id=900,
+            sender_name="Лена",
+        )
+        model_client.responses.create.return_value = SimpleNamespace(
+            output_text=json.dumps(
+                {
+                    "should_write": True,
+                    "contact_id": "100",
+                    "message": "Только вернулась с прогулки — было так хорошо 🙂",
+                    "note": "Хочется поделиться с Леной.",
+                },
+                ensure_ascii=False,
+            )
+        )
+        reflector = MilanaInitiativeReflector(
+            client,
+            model_client,
+            responder.config,
+            responder.routine,
+            responder.memory,
+            responder.presence,
+            now=clock.now,
+            sleep=clock.sleep,
+        )
+        state = responder.routine.state_at(clock.value)
+
+        with patch("builtins.print"):
+            decision = await reflector.reflect(
+                state.current,
+                clock.value,
+            )
+
+        self.assertTrue(decision.should_write if decision else False)
+        request = model_client.responses.create.await_args.kwargs
+        self.assertIn("Спорт", str(request["input"]))
+        self.assertIn("Как прошла прогулка?", str(request["input"]))
+        self.assertIn("json_schema", str(request["text"]))
+        client.action.assert_called_once_with(entity, "typing")
+        client.send_message.assert_awaited_once_with(
+            entity,
+            "Только вернулась с прогулки — было так хорошо 🙂",
+        )
+        history = responder.memory.get_chat_history(100, limit=2)
+        self.assertEqual(history[-1].role, "assistant")
+        self.assertEqual(history[-1].telegram_message_id, 901)
+        responder.presence.finish_response.assert_awaited_once_with(answered=True)
+
+    async def test_reflection_may_naturally_decide_not_to_write(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 18, 30, tzinfo=YEKT))
+        responder, client, model_client = make_responder(clock)
+        responder.presence.begin_response = AsyncMock()
+        responder.presence.finish_response = AsyncMock()
+        entity = SimpleNamespace(id=100, bot=False, deleted=False, is_self=False)
+        client.iter_dialogs.return_value = self._dialogs(
+            SimpleNamespace(
+                id=100,
+                name="Лена",
+                entity=entity,
+                is_user=True,
+                message=SimpleNamespace(raw_text="До вечера", out=False),
+            )
+        )
+        model_client.responses.create.return_value = SimpleNamespace(
+            output_text=json.dumps(
+                {
+                    "should_write": False,
+                    "contact_id": None,
+                    "message": None,
+                    "note": "Сейчас естественнее продолжить заниматься спортом.",
+                },
+                ensure_ascii=False,
+            )
+        )
+        reflector = MilanaInitiativeReflector(
+            client,
+            model_client,
+            responder.config,
+            responder.routine,
+            responder.memory,
+            responder.presence,
+            now=clock.now,
+            sleep=clock.sleep,
+        )
+
+        with patch("builtins.print"):
+            decision = await reflector.reflect(
+                responder.routine.activity_at("mon", 18 * 60 + 30),
+                clock.value,
+            )
+
+        self.assertFalse(decision.should_write if decision else True)
+        client.send_message.assert_not_awaited()
+        responder.presence.begin_response.assert_not_awaited()
 
 
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
