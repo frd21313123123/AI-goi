@@ -1108,6 +1108,7 @@ class PreparedIncoming:
 class GeneratedReply:
     messages: tuple[str, ...]
     reaction: str | None = None
+    blacklist_sender: bool = False
     staged_diary_entries: tuple[str, ...] = ()
 
 
@@ -1540,10 +1541,11 @@ class SendOutcome:
     sent_count: int
     interrupted: bool
     reaction_sent: bool = False
+    blacklisted: bool = False
 
     @property
     def answered(self) -> bool:
-        return self.reaction_sent or self.sent_count > 0
+        return self.blacklisted or self.reaction_sent or self.sent_count > 0
 
 
 class MilanaMessageResponder:
@@ -1771,8 +1773,9 @@ class MilanaMessageResponder:
                                     {"type": "null"},
                                 ]
                             },
+                            "blacklist_sender": {"type": "boolean"},
                         },
-                        "required": ["messages", "reaction"],
+                        "required": ["messages", "reaction", "blacklist_sender"],
                         "additionalProperties": False,
                     },
                 }
@@ -2138,6 +2141,11 @@ class MilanaMessageResponder:
         reaction = payload.get("reaction")
         if reaction is not None and reaction not in SAFE_REACTIONS:
             raise ValueError("Структурированный ответ содержит недопустимую реакцию")
+        blacklist_sender = payload.get("blacklist_sender")
+        if not isinstance(blacklist_sender, bool):
+            raise ValueError(
+                "Структурированный ответ не содержит логическое поле blacklist_sender"
+            )
 
         raw_messages = payload["messages"]
         if any(not isinstance(message, str) for message in raw_messages):
@@ -2148,6 +2156,7 @@ class MilanaMessageResponder:
         return GeneratedReply(
             messages=messages,
             reaction=reaction,
+            blacklist_sender=blacklist_sender,
             staged_diary_entries=tuple(staged_diary_entries),
         )
 
@@ -2185,7 +2194,13 @@ class MilanaMessageResponder:
             "например, не поняла вложение, не знаешь ответа или не хочешь обсуждать тему — мягко "
             "и естественно уйди от ответа в стиле живой переписки: коротко смени тему, отшутись "
             "или задай уместный встречный вопрос. Не упоминай модель, провайдера, API, системные "
-            "ограничения, недоступный формат или внутреннюю ошибку. Каждая строка массива messages будет отправлена "
+            "ограничения, недоступный формат или внутреннюю ошибку. Поле blacklist_sender "
+            "позволяет тебе окончательно прекратить контакт и добавить автора последнего "
+            "входящего сообщения в чёрный список Telegram. Ставь true только по собственному "
+            "решению при серьёзных угрозах, травле, систематических оскорблениях или навязчивом "
+            "спаме; не блокируй из-за обычного несогласия, единичной грубости, шутки или одной "
+            "просьбы собеседника. При желании сначала добавь в messages последнюю реплику; после "
+            "блокировки новые сообщения этого человека приходить не будут. Каждая строка массива messages будет отправлена "
             "отдельным сообщением; не добавляй служебные пояснения."
         )
         input_items: list[Any] = [*history_input]
@@ -2890,6 +2905,7 @@ class MilanaMessageResponder:
         reply_event = active[-1].event
         sent_count = 0
         reaction_sent = False
+        blacklisted = False
         diary_committed = False
 
         def commit_diary_once() -> None:
@@ -2998,10 +3014,41 @@ class MilanaMessageResponder:
                 )
             commit_diary_once()
 
+        if reply.blacklist_sender:
+            if await self._revision(state) != revision:
+                return SendOutcome(
+                    sent_count=sent_count,
+                    interrupted=True,
+                    reaction_sent=reaction_sent,
+                )
+            if not self._full_online_window_is_open(
+                continues_conversation=continues_conversation
+            ):
+                return SendOutcome(
+                    sent_count=sent_count,
+                    interrupted=True,
+                    reaction_sent=reaction_sent,
+                )
+            try:
+                sender = await reply_event.get_input_sender()
+                if sender is None:
+                    raise TypeError("Telethon не смог определить отправителя сообщения")
+                await self.client(functions.contacts.BlockRequest(id=sender))
+            except (RPCError, OSError, TypeError, ValueError, AttributeError) as exc:
+                print(
+                    f"Ошибка добавления отправителя message_id={reply_event.id} "
+                    f"в чёрный список: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                blacklisted = True
+                commit_diary_once()
+
         return SendOutcome(
             sent_count=sent_count,
             interrupted=False,
             reaction_sent=reaction_sent,
+            blacklisted=blacklisted,
         )
 
     async def _update_summary_while_idle(self, state: ChatWorkerState) -> None:
@@ -3165,6 +3212,7 @@ class MilanaMessageResponder:
 
                 sent_count = outcome.sent_count if outcome is not None else 0
                 reaction_sent = bool(outcome and outcome.reaction_sent)
+                blacklisted = bool(outcome and outcome.blacklisted)
                 answered = bool(outcome and outcome.answered)
                 interrupted = bool(outcome and outcome.interrupted and answered)
                 if reaction_sent:
@@ -3175,6 +3223,11 @@ class MilanaMessageResponder:
                     print(
                         f"Отправлено частей ИИ-ответа: {sent_count}; "
                         f"последний входящий message_id={reply_event.id}"
+                    )
+                if blacklisted:
+                    print(
+                        "Отправитель добавлен в чёрный список по решению Миланы: "
+                        f"message_id={reply_event.id}"
                     )
                 if outcome is not None and not answered:
                     print(

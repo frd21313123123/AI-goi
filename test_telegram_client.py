@@ -90,12 +90,17 @@ class GatedClock(AdvancingClock):
 def structured_response(
     *messages: str,
     reaction: str | None = None,
+    blacklist_sender: bool = False,
     output=None,
     agy_diary_entries=(),
 ):
     return SimpleNamespace(
         output_text=json.dumps(
-            {"messages": list(messages), "reaction": reaction},
+            {
+                "messages": list(messages),
+                "reaction": reaction,
+                "blacklist_sender": blacklist_sender,
+            },
             ensure_ascii=False,
         ),
         output=[] if output is None else output,
@@ -197,6 +202,7 @@ def make_event(
         sticker=sticker_document,
         message=message,
         get_input_chat=AsyncMock(return_value="peer"),
+        get_input_sender=AsyncMock(return_value="sender-peer"),
         get_sender=AsyncMock(return_value=None),
         reply=AsyncMock(),
     )
@@ -1557,7 +1563,14 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         )
         schema = request["text"]["format"]["schema"]
         self.assertEqual(schema["properties"]["messages"]["minItems"], 0)
-        self.assertEqual(schema["required"], ["messages", "reaction"])
+        self.assertEqual(
+            schema["required"],
+            ["messages", "reaction", "blacklist_sender"],
+        )
+        self.assertEqual(
+            schema["properties"]["blacklist_sender"],
+            {"type": "boolean"},
+        )
         self.assertEqual(
             schema["properties"]["reaction"]["anyOf"][0]["enum"],
             ["👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔"],
@@ -1571,6 +1584,29 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             [(item.content, item.telegram_message_id) for item in assistant_messages],
             [("Первая мысль", 401), ("Вторая мысль", 402)],
         )
+
+    async def test_model_can_blacklist_the_sender_without_sending_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        openai_client.responses.create.return_value = structured_response(
+            blacklist_sender=True
+        )
+        event = make_event(clock.value, sender_id=777)
+        sender_peer = types.InputPeerUser(user_id=777, access_hash=123)
+        event.get_input_sender.return_value = sender_peer
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        client.send_message.assert_not_awaited()
+        event.get_input_sender.assert_awaited_once_with()
+        client.assert_called_once()
+        request = client.call_args.args[0]
+        self.assertIsInstance(request, functions.contacts.BlockRequest)
+        self.assertEqual(request.id, sender_peer)
+        instructions = openai_client.responses.create.await_args.kwargs["instructions"]
+        self.assertIn("blacklist_sender", instructions)
+        self.assertIn("чёрный список Telegram", instructions)
 
     async def test_new_input_during_inter_part_delay_stops_series_and_continues(self) -> None:
         clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -3048,6 +3084,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "messages": ["  Первая часть  ", "", "   ", "Вторая часть"],
                     "reaction": None,
+                    "blacklist_sender": False,
                 },
                 ensure_ascii=False,
             ),
