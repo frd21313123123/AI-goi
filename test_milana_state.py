@@ -894,6 +894,39 @@ class WorldStateTests(unittest.TestCase):
         self.assertEqual(committed.mood, "заинтересованное")
         self.assertIsNone(committed.last_heartbeat_at)
 
+    def test_intention_expires_when_next_heartbeat_does_not_renew_it(self) -> None:
+        initial = self.store.update_agent_state(
+            current_intention="поесть",
+            at=NOW,
+        )
+        self.assertEqual(initial.current_intention, "поесть")
+        self.assertEqual(initial.current_intention_updated_at, NOW)
+
+        expired = self.store.apply_heartbeat_changes(
+            HeartbeatChanges(),
+            expected_revision=initial.revision,
+            at=NOW + timedelta(minutes=30),
+        )
+
+        self.assertIsNone(expired.current_intention)
+        self.assertIsNone(expired.current_intention_updated_at)
+
+    def test_non_heartbeat_turn_does_not_clear_intention(self) -> None:
+        initial = self.store.update_agent_state(
+            current_intention="поесть",
+            at=NOW,
+        )
+
+        committed = self.store.apply_heartbeat_changes(
+            HeartbeatChanges(),
+            expected_revision=initial.revision,
+            at=NOW + timedelta(minutes=30),
+            record_heartbeat=False,
+        )
+
+        self.assertEqual(committed.current_intention, "поесть")
+        self.assertEqual(committed.current_intention_updated_at, NOW)
+
     def test_heartbeat_changes_idempotency_survives_reopen(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "milana.sqlite3"

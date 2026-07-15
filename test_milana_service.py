@@ -222,6 +222,39 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             build_heartbeat_changes(payload, self.state.get_agent_state())
 
+    async def test_chat_context_weakens_needs_and_hides_stale_intention(self):
+        state = self.state.apply_need_deltas(
+            {"social": -15, "rest": 15},
+            at=NOW - timedelta(hours=1),
+        )
+        self.state.update_agent_state(
+            current_intention="поесть",
+            expected_revision=state.revision,
+            at=NOW - timedelta(minutes=21),
+        )
+        service = self.service()
+
+        context = await service._state_context(_production_telegram_trigger())
+
+        self.assertEqual(context["world"]["needs"]["social"], 47)
+        self.assertEqual(context["world"]["needs"]["rest"], 53)
+        self.assertIsNone(context["world"]["current_intention"])
+        self.assertEqual(
+            context["turn_policy"]["personal_state_influence"],
+            "weak_background_only",
+        )
+
+    async def test_chat_context_keeps_only_fresh_intention(self):
+        self.state.update_agent_state(
+            current_intention="поесть",
+            at=NOW - timedelta(minutes=19),
+        )
+        service = self.service()
+
+        context = await service._state_context(_production_telegram_trigger())
+
+        self.assertEqual(context["world"]["current_intention"], "поесть")
+
     async def test_production_ordinary_text_notice_stays_one_call_fast_path(self):
         self.supervisor.open_text = "Как у тебя дела?"
         fast_final = {

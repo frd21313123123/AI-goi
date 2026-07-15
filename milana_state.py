@@ -49,6 +49,7 @@ class AgentState:
     novelty: int
     achievement: int
     current_intention: str | None
+    current_intention_updated_at: datetime | None
     last_heartbeat_at: datetime | None
     next_heartbeat_at: datetime | None
     heartbeat_paused: bool
@@ -524,6 +525,7 @@ class MilanaStateStore:
             novelty_need INTEGER NOT NULL DEFAULT 50 CHECK (novelty_need BETWEEN 0 AND 100),
             achievement_need INTEGER NOT NULL DEFAULT 50 CHECK (achievement_need BETWEEN 0 AND 100),
             current_intention TEXT,
+            current_intention_updated_at TEXT,
             last_heartbeat_at TEXT,
             next_heartbeat_at TEXT,
             heartbeat_paused INTEGER NOT NULL DEFAULT 0 CHECK (heartbeat_paused IN (0, 1)),
@@ -772,6 +774,27 @@ class MilanaStateStore:
                     "ALTER TABLE telegram_turn_metrics "
                     "ADD COLUMN sla_eligible INTEGER "
                     "CHECK (sla_eligible IN (0, 1))"
+                )
+            agent_state_columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(agent_state)"
+                ).fetchall()
+            }
+            if "current_intention_updated_at" not in agent_state_columns:
+                self._connection.execute(
+                    "ALTER TABLE agent_state "
+                    "ADD COLUMN current_intention_updated_at TEXT"
+                )
+                self._connection.execute(
+                    """
+                    UPDATE agent_state
+                    SET current_intention_updated_at = COALESCE(
+                        last_heartbeat_at,
+                        updated_at
+                    )
+                    WHERE current_intention IS NOT NULL
+                    """
                 )
             # Backfill the normalized ownership index for databases created by
             # the original JSON-only outbox schema.  Keep all conflicting old
@@ -1749,6 +1772,9 @@ class MilanaStateStore:
                 if row["current_intention"] is not None
                 else None
             ),
+            current_intention_updated_at=_parse_timestamp(
+                row["current_intention_updated_at"]
+            ),
             last_heartbeat_at=_parse_timestamp(row["last_heartbeat_at"]),
             next_heartbeat_at=_parse_timestamp(row["next_heartbeat_at"]),
             heartbeat_paused=bool(row["heartbeat_paused"]),
@@ -1803,6 +1829,9 @@ class MilanaStateStore:
             changes["arousal"] = arousal
         if current_intention is not None or clear_intention:
             changes["current_intention"] = current_intention
+            changes["current_intention_updated_at"] = (
+                _timestamp(at or _now()) if current_intention is not None else None
+            )
         if not changes:
             return self.get_agent_state()
         return self._update_agent_columns(
@@ -3574,6 +3603,15 @@ class MilanaStateStore:
                     assignments["arousal"] = arousal
                 if intention is not None:
                     assignments["current_intention"] = intention
+                    assignments["current_intention_updated_at"] = _timestamp(
+                        changed_at
+                    )
+                elif record_heartbeat:
+                    # Intentions are deliberately ephemeral.  A reflective
+                    # heartbeat must explicitly renew one; otherwise the old
+                    # desire is removed instead of leaking into future chats.
+                    assignments["current_intention"] = None
+                    assignments["current_intention_updated_at"] = None
                 if record_heartbeat:
                     assignments["last_heartbeat_at"] = _timestamp(changed_at)
                 assignments["revision"] = actual_revision + 1

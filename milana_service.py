@@ -91,6 +91,8 @@ SUMMARY_TRIGGER_USER_MESSAGES = 100
 SUMMARY_RETAIN_USER_MESSAGES = 40
 SUMMARY_CHUNK_MAX_MESSAGES = 100
 SUMMARY_CHUNK_MAX_CHARACTERS = 40_000
+CHAT_NEED_INFLUENCE = 0.2
+CHAT_INTENTION_TTL = timedelta(minutes=20)
 _WORKER_STOP = object()
 
 
@@ -125,6 +127,26 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return [_json_ready(item) for item in value]
     return value
+
+
+def _chat_need_value(value: int) -> int:
+    """Compress a raw need around neutral so it remains a weak chat signal."""
+
+    return 50 + round((int(value) - 50) * CHAT_NEED_INFLUENCE)
+
+
+def _fresh_chat_intention(state: Any, *, at: datetime) -> str | None:
+    """Return only a recently renewed intention for conversational context."""
+
+    intention = getattr(state, "current_intention", None)
+    renewed_at = getattr(state, "current_intention_updated_at", None)
+    if not isinstance(intention, str) or not intention.strip():
+        return None
+    if not isinstance(renewed_at, datetime):
+        return None
+    if at.astimezone(timezone.utc) - renewed_at.astimezone(timezone.utc) > CHAT_INTENTION_TTL:
+        return None
+    return intention
 
 
 def _parse_datetime(value: Any, *, field_name: str) -> datetime:
@@ -2078,6 +2100,10 @@ class MilanaService:
     async def _state_context(self, trigger: TurnTrigger) -> Mapping[str, Any]:
         if self.agent._is_compact_telegram_trigger(trigger):
             state = self.state.get_agent_state()
+            chat_needs = {
+                name: _chat_need_value(value)
+                for name, value in state.needs.items()
+            }
             chat_id = trigger.metadata.get("chat_id")
             relationship = None
             if isinstance(chat_id, (str, int)) and not isinstance(chat_id, bool):
@@ -2091,8 +2117,11 @@ class MilanaService:
                     "mood": state.mood,
                     "valence": state.valence,
                     "arousal": state.arousal,
-                    "needs": dict(state.needs),
-                    "current_intention": state.current_intention,
+                    "needs": chat_needs,
+                    "current_intention": _fresh_chat_intention(
+                        state,
+                        at=trigger.occurred_at,
+                    ),
                     "relationship": (
                         {
                             "closeness": relationship.closeness,
@@ -2111,6 +2140,13 @@ class MilanaService:
                     "one_telegram_message": True,
                     "application_reply_only": True,
                     "model_tools": "none_except_explicit_sticker_request",
+                    "personal_state_influence": "weak_background_only",
+                    "personal_state_rules": [
+                        "Потребности и текущее намерение лишь слегка меняют тон ответа.",
+                        "Не упоминай потребность сама по себе и не переводи на неё тему.",
+                        "Говори о потребности только если это прямо уместно в текущем диалоге.",
+                        "Не повторяй одну и ту же потребность в соседних сообщениях.",
+                    ],
                 },
             }
         world = self.state.load_world_context()
